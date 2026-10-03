@@ -22,6 +22,14 @@ namespace
     // Longest annotation text shown, in UTF-16 code units.
     const ULONG32 MaxAnnotationLength = 4096;
 
+    DWORD GetThreadOSId(ICorDebugThread *pThread)
+    {
+        DWORD threadId = 0;
+        if (FAILED(pThread->GetID(&threadId)))
+            return 0;
+        return threadId;
+    }
+
     HRESULT GetMetaDataImport(ICorDebugModule *pModule, IMetaDataImport **ppMD)
     {
         HRESULT Status;
@@ -311,16 +319,10 @@ namespace
             *ppFrame = pFrame;
             return E_ABORT; // Fast exit from cycle.
         });
+        LOGI("Annotations: thread %u has no active managed frame; stack walk %s", (unsigned)GetThreadOSId(pThread),
+             *ppFrame != nullptr ? "found one" : "found none");
 
         return *ppFrame != nullptr ? S_OK : E_FAIL;
-    }
-
-    DWORD GetThreadOSId(ICorDebugThread *pThread)
-    {
-        DWORD threadId = 0;
-        if (FAILED(pThread->GetID(&threadId)))
-            return 0;
-        return threadId;
     }
 
 } // unnamed namespace
@@ -562,7 +564,10 @@ HRESULT Annotations::ReadStoreOnThread(StoreRef &ref, ICorDebugThread *pThread, 
     HRESULT Status = FindMatchOnThread(ref, pThread, exceptionAddress, stoppedThread, text);
     if (SUCCEEDED(Status))
         return Status;
-    if (Status != CORDBG_E_STATIC_VAR_NOT_AVAILABLE)
+    if (Status == CORDBG_E_STATIC_VAR_NOT_AVAILABLE)
+        LOGI("Annotations: store %s: thread %u never recorded (no storage)", ref.store.name.c_str(),
+             (unsigned)GetThreadOSId(pThread));
+    else
         LOGI("Annotations: store %s skipped on thread %u: %s", ref.store.name.c_str(), (unsigned)GetThreadOSId(pThread),
              errormessage(Status));
     return S_FALSE;
