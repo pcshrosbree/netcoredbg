@@ -36,6 +36,7 @@ class ManagedCallback;
 class CallbacksQueue;
 class Breakpoints;
 class Modules;
+class Annotations;
 
 enum class ProcessAttachedState
 {
@@ -89,6 +90,7 @@ protected:
     std::shared_ptr<Variables> m_sharedVariables;
     std::unique_ptr<Steppers> m_uniqueSteppers;
     std::shared_ptr<Breakpoints> m_sharedBreakpoints;
+    std::shared_ptr<Annotations> m_sharedAnnotations;
     std::shared_ptr<CallbacksQueue> m_sharedCallbacksQueue;
     std::unique_ptr<ManagedCallback> m_uniqueManagedCallback;
 #ifdef INTEROP_DEBUGGING
@@ -162,6 +164,7 @@ public:
 #ifdef INTEROP_DEBUGGING
     void SetInteropDebugging(bool enable) override;
 #endif
+    void SetExceptionAnnotations(bool enable, const std::vector<std::string> &extraStoreNames, unsigned threadLimit) override;
 
     HRESULT Initialize() override;
     HRESULT Attach(int pid) override;
@@ -192,6 +195,7 @@ public:
     HRESULT SetVariable(const std::string &name, const std::string &value, uint32_t ref, std::string &output) override;
     HRESULT SetExpression(FrameId frameId, const std::string &expression, int evalFlags, const std::string &value, std::string &output) override;
     HRESULT GetExceptionInfo(ThreadId threadId, ExceptionInfo &exceptionInfo) override;
+    HRESULT AppendExceptionAnnotations(ThreadId threadId, ExceptionInfo &exceptionInfo) override;
     HRESULT GetSourceFile(const std::string &sourcePath, char** fileBuf, int* fileLen) override;
     void FreeUnmanaged(PVOID mem) override;
     HRESULT HotReloadApplyDeltas(const std::string &dllFileName, const std::string &deltaMD, const std::string &deltaIL,

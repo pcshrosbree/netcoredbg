@@ -18,6 +18,7 @@
 #include <sys/types.h>
 #include <sys/stat.h>
 #include "interfaces/iprotocol.h"
+#include "debugger/annotations.h"
 #include "debugger/threads.h"
 #include "debugger/frames.h"
 #include "debugger/evalhelpers.h"
@@ -199,6 +200,7 @@ ManagedDebuggerBase::ManagedDebuggerBase(IProtocol *pProtocol_) :
     m_sharedVariables(new Variables(m_sharedEvalHelpers, m_sharedEvaluator, m_sharedEvalStackMachine)),
     m_uniqueSteppers(new Steppers(m_sharedModules, m_sharedEvalHelpers)),
     m_sharedBreakpoints(new Breakpoints(m_sharedModules, m_sharedEvaluator, m_sharedEvalHelpers, m_sharedVariables)),
+    m_sharedAnnotations(new Annotations(m_sharedModules)),
     m_sharedCallbacksQueue(nullptr),
     m_uniqueManagedCallback(nullptr),
 #ifdef INTEROP_DEBUGGING
@@ -382,6 +384,7 @@ HRESULT ManagedDebugger::StepCommand(ThreadId threadId, StepType stepType)
     IfFailRet(m_uniqueSteppers->SetupStep(pThread, stepType));
 
     m_sharedVariables->Clear(); // Important, must be sync with MIProtocol m_vars.clear()
+    m_sharedAnnotations->ClearStopCache();
     FrameId::invalidate(); // Clear all created during break frames.
     pProtocol->EmitContinuedEvent(threadId); // VSCode protocol need thread ID.
 
@@ -414,6 +417,7 @@ HRESULT ManagedDebugger::Continue(ThreadId threadId)
     }
 
     m_sharedVariables->Clear(); // Important, must be sync with MIProtocol m_vars.clear()
+    m_sharedAnnotations->ClearStopCache();
     FrameId::invalidate(); // Clear all created during break frames.
     pProtocol->EmitContinuedEvent(threadId); // VSCode protocol need thread ID.
 
@@ -848,6 +852,7 @@ void ManagedDebuggerBase::Cleanup()
     m_sharedModules->CleanupAllModules();
     m_sharedEvalHelpers->Cleanup();
     m_sharedVariables->Clear(); // Important, must be sync with MIProtocol m_vars.clear()
+    m_sharedAnnotations->Cleanup();
     pProtocol->Cleanup();
 
     std::lock_guard<Utility::RWLock::Writer> guardProcessRWLock(m_debugProcessRWLock.writer);
@@ -915,6 +920,19 @@ HRESULT ManagedDebugger::GetExceptionInfo(ThreadId threadId, ExceptionInfo &exce
     ToRelease<ICorDebugThread> iCorThread;
     IfFailRet(m_iCorProcess->GetThread(int(threadId), &iCorThread));
     return m_sharedBreakpoints->GetExceptionInfo(iCorThread, exceptionInfo);
+}
+
+HRESULT ManagedDebugger::AppendExceptionAnnotations(ThreadId threadId, ExceptionInfo &exceptionInfo)
+{
+    LogFuncEntry();
+
+    std::lock_guard<Utility::RWLock::Reader> guardProcessRWLock(m_debugProcessRWLock.reader);
+    HRESULT Status;
+    IfFailRet(CheckDebugProcess());
+
+    ToRelease<ICorDebugThread> iCorThread;
+    IfFailRet(m_iCorProcess->GetThread(int(threadId), &iCorThread));
+    return m_sharedAnnotations->AppendExceptionAnnotations(iCorThread, exceptionInfo);
 }
 
 HRESULT ManagedDebugger::SetExceptionBreakpoints(const std::vector<ExceptionBreakpoint> &exceptionBreakpoints, std::vector<Breakpoint> &breakpoints)
@@ -1572,6 +1590,11 @@ void ManagedDebugger::SetStepFiltering(bool enable)
 {
     m_stepFiltering = enable;
     m_uniqueSteppers->SetStepFiltering(enable);
+}
+
+void ManagedDebugger::SetExceptionAnnotations(bool enable, const std::vector<std::string> &extraStoreNames, unsigned threadLimit)
+{
+    m_sharedAnnotations->SetOptions(enable, extraStoreNames, threadLimit);
 }
 
 HRESULT ManagedDebugger::SetHotReload(bool enable)

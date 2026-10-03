@@ -72,6 +72,7 @@ public:
 #ifdef INTEROP_DEBUGGING
     virtual void SetInteropDebugging(bool enable) = 0;
 #endif
+    virtual void SetExceptionAnnotations(bool enable, const std::vector<std::string> &extraStoreNames, unsigned threadLimit) = 0;
     virtual HRESULT Initialize() = 0;
     virtual HRESULT Attach(int pid) = 0;
     virtual HRESULT Launch(const std::string &fileExec, const std::vector<std::string> &execArgs, const std::map<std::string, std::string> &env,
@@ -99,6 +100,9 @@ public:
     virtual HRESULT SetVariable(const std::string &name, const std::string &value, uint32_t ref, std::string &output) = 0;
     virtual HRESULT SetExpression(FrameId frameId, const std::string &expression, int evalFlags, const std::string &value, std::string &output) = 0;
     virtual HRESULT GetExceptionInfo(ThreadId threadId, ExceptionInfo &exceptionInfo) = 0;
+    // Appends debugger annotations recorded for the thread's current exception to exceptionInfo.description.
+    // Call only for an exceptionInfo request, after GetExceptionInfo succeeded.
+    virtual HRESULT AppendExceptionAnnotations(ThreadId threadId, ExceptionInfo &exceptionInfo) = 0;
     virtual HRESULT GetSourceFile(const std::string &sourcePath, char** fileBuf, int* fileLen) = 0;
     virtual void FreeUnmanaged(PVOID mem) = 0;
     virtual HRESULT HotReloadApplyDeltas(const std::string &dllFileName, const std::string &deltaMD, const std::string &deltaIL,

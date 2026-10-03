@@ -7,6 +7,7 @@
 #endif
 
 #include "debugger/managedcallback.h"
+#include "debugger/annotations.h"
 #include "debugger/callbacksqueue.h"
 #include "debugger/threads.h"
 #include "debugger/evalwaiter.h"
@@ -306,6 +307,7 @@ HRESULT STDMETHODCALLTYPE ManagedCallback::LoadModule(ICorDebugAppDomain *pAppDo
         }
     }
     m_debugger.m_sharedBreakpoints->ManagedCallbackLoadModuleAll(pModule);
+    m_debugger.m_sharedAnnotations->ManagedCallbackLoadModule(pModule, module.name == "System.Private.CoreLib.dll");
 
     // enable Debugger.NotifyOfCrossThreadDependency after System.Private.CoreLib.dll loaded (trigger for 1 time call only)
     if (module.name == "System.Private.CoreLib.dll")
@@ -320,6 +322,7 @@ HRESULT STDMETHODCALLTYPE ManagedCallback::LoadModule(ICorDebugAppDomain *pAppDo
 HRESULT STDMETHODCALLTYPE ManagedCallback::UnloadModule(ICorDebugAppDomain *pAppDomain, ICorDebugModule *pModule)
 {
     LogFuncEntry();
+    m_debugger.m_sharedAnnotations->ManagedCallbackUnloadModule(pModule);
     return m_sharedCallbacksQueue->ContinueAppDomain(pAppDomain);
 }
 

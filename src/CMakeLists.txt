@@ -118,6 +118,7 @@ add_custom_command(
 )
 
 set(netcoredbg_SRC
+    debugger/annotations.cpp
     debugger/breakpoint_break.cpp
     debugger/breakpoint_entry.cpp
     debugger/breakpoint_hotreload.cpp

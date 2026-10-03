@@ -481,6 +481,17 @@ void VSCodeProtocol::EmitEvent(const std::string &name, const nlohmann::json &bo
     EmitMessageWithLog(LOG_EVENT, message);
 }
 
+// Debugger annotations shown with exception info (launch and attach options):
+//   "exceptionAnnotations": false                   turn the reader off (default: on);
+//   "exceptionAnnotationStores": ["Ns.Type", ...]   holder types to read besides System.Diagnostics.DebuggerAnnotationStore;
+//   "exceptionAnnotationThreadLimit": N             search at most N other threads per store (default 0: all).
+static void SetExceptionAnnotations(std::shared_ptr<IDebugger> &sharedDebugger, const json &arguments)
+{
+    sharedDebugger->SetExceptionAnnotations(arguments.value("exceptionAnnotations", true),
+                                            arguments.value("exceptionAnnotationStores", std::vector<std::string>()),
+                                            arguments.value("exceptionAnnotationThreadLimit", 0u));
+}
+
 static HRESULT HandleCommand(std::shared_ptr<IDebugger> &sharedDebugger, std::string &fileExec, std::vector<std::string> &execArgs,
                              const std::string &command, const json &arguments, json &body)
 {
@@ -561,6 +572,8 @@ static HRESULT HandleCommand(std::shared_ptr<IDebugger> &sharedDebugger, std::st
         ThreadId threadId{int(arguments.at("threadId"))};
         ExceptionInfo exceptionInfo;
         IfFailRet(sharedDebugger->GetExceptionInfo(threadId, exceptionInfo));
+        // Here and not in GetExceptionInfo, which stack traces also call.
+        IfFailRet(sharedDebugger->AppendExceptionAnnotations(threadId, exceptionInfo));
 
         body["exceptionId"] = exceptionInfo.exceptionId;
         body["description"] = exceptionInfo.description;
@@ -599,6 +612,7 @@ static HRESULT HandleCommand(std::shared_ptr<IDebugger> &sharedDebugger, std::st
 
         sharedDebugger->SetJustMyCode(arguments.value("justMyCode", true)); // MS vsdbg have "justMyCode" enabled by default.
         sharedDebugger->SetStepFiltering(arguments.value("enableStepFiltering", true)); // MS vsdbg have "enableStepFiltering" enabled by default.
+        SetExceptionAnnotations(sharedDebugger, arguments);
 
         if (!fileExec.empty())
             return sharedDebugger->Launch(fileExec, execArgs, env, cwd, arguments.value("stopAtEntry", false));
@@ -809,6 +823,7 @@ static HRESULT HandleCommand(std::shared_ptr<IDebugger> &sharedDebugger, std::st
         else
             return E_INVALIDARG;
 
+        SetExceptionAnnotations(sharedDebugger, arguments);
         return sharedDebugger->Attach(processId);
     } },
     { "setVariable", [&](const json &arguments, json &body) {
