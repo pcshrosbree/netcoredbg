@@ -484,12 +484,19 @@ void VSCodeProtocol::EmitEvent(const std::string &name, const nlohmann::json &bo
 // Debugger annotations shown with exception info (launch and attach options):
 //   "exceptionAnnotations": false                   turn the reader off (default: on);
 //   "exceptionAnnotationStores": ["Ns.Type", ...]   holder types to read besides System.Diagnostics.DebuggerAnnotationStore;
-//   "exceptionAnnotationThreadLimit": N             search at most N other threads per store (default 0: all).
+//   "exceptionAnnotationThreadLimit": N             read at most N other threads per store (default 0: all; a
+//                                                   negative N is treated as 0).
 static void SetExceptionAnnotations(std::shared_ptr<IDebugger> &sharedDebugger, const json &arguments)
 {
+    int64_t threadLimit = arguments.value("exceptionAnnotationThreadLimit", int64_t(0));
+    if (threadLimit < 0 || threadLimit > int64_t(UINT_MAX))
+    {
+        LOGW("exceptionAnnotationThreadLimit %lld is out of range, reading all threads", (long long)threadLimit);
+        threadLimit = 0;
+    }
     sharedDebugger->SetExceptionAnnotations(arguments.value("exceptionAnnotations", true),
                                             arguments.value("exceptionAnnotationStores", std::vector<std::string>()),
-                                            arguments.value("exceptionAnnotationThreadLimit", 0u));
+                                            unsigned(threadLimit));
 }
 
 static HRESULT HandleCommand(std::shared_ptr<IDebugger> &sharedDebugger, std::string &fileExec, std::vector<std::string> &execArgs,
@@ -573,7 +580,9 @@ static HRESULT HandleCommand(std::shared_ptr<IDebugger> &sharedDebugger, std::st
         ExceptionInfo exceptionInfo;
         IfFailRet(sharedDebugger->GetExceptionInfo(threadId, exceptionInfo));
         // Here and not in GetExceptionInfo, which stack traces also call.
-        IfFailRet(sharedDebugger->AppendExceptionAnnotations(threadId, exceptionInfo));
+        // Annotations are optional: a failure to add them never fails the exception info.
+        if (FAILED(Status = sharedDebugger->AppendExceptionAnnotations(threadId, exceptionInfo)))
+            LOGW("Exception annotations not added: %s", errormessage(Status));
 
         body["exceptionId"] = exceptionInfo.exceptionId;
         body["description"] = exceptionInfo.description;

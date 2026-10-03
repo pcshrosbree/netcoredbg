@@ -39,9 +39,10 @@ class Modules;
 // The reader never runs code in the debuggee: it reads fields with ICorDebugClass::GetStaticFieldValue and
 // ICorDebugObjectValue::GetFieldValue only, never through the expression evaluator (which creates a type object
 // with a func-eval the first time a session touches a type's statics). That is exact only for a holder without a
-// static constructor, so a holder that has one is never read. A string value is shown verbatim (truncated), any
-// other value as its type name; ToString() is never called. Any ICorDebug error while reading a store skips that
-// store for that thread; it never fails or delays the report.
+// static constructor, so a holder that has one is never read; nor is one whose fields are not [ThreadStatic] or whose
+// Entry is not sealed. A string value is shown verbatim (truncated), any other value as its type name; ToString() is
+// never called. Any ICorDebug error while reading a store skips that store for that thread, and no error of the
+// reader fails or delays the report.
 class Annotations
 {
 public:
@@ -57,8 +58,8 @@ public:
     {}
 
     // enable: the reader is on by default. extraStoreNames: holder type names to search besides the default one
-    // (namespace-qualified, `+` for nested types); they must satisfy the same contract. threadLimit: at most this
-    // many other threads are searched per store and stop (0: all).
+    // (namespace-qualified, `+` for nested types; duplicates are ignored); they must satisfy the same contract.
+    // threadLimit: at most this many other threads with a managed frame are read per store and stop (0: all).
     void SetOptions(bool enable, const std::vector<std::string> &extraStoreNames, unsigned threadLimit);
 
     // Stores are ordered by the order modules were observed, so record it as modules load (on attach, the runtime
@@ -106,6 +107,13 @@ private:
         Store store;
     };
 
+    // A thread other than the stopped one, with any managed frame of it (used only to name the thread to the DBI).
+    struct OtherThread
+    {
+        DWORD threadId = 0;
+        ToRelease<ICorDebugFrame> pFrame;
+    };
+
     std::shared_ptr<Modules> m_sharedModules;
 
     std::mutex m_mutex;
@@ -119,13 +127,15 @@ private:
     // Every ring read since the session started; written to the log, so a test can see when reads happen.
     uint64_t m_ringReads;
 
+    HRESULT AppendExceptionAnnotationsImpl(ICorDebugThread *pThread, ExceptionInfo &exceptionInfo);
     HRESULT GetStores(std::vector<StoreRef> &stores);
-    void ScanModule(ICorDebugModule *pModule, std::vector<Store> &stores);
-    HRESULT FindMatchOnThread(StoreRef &store, ICorDebugThread *pThread, CORDB_ADDRESS exceptionAddress, bool stoppedThread,
+    bool ScanModule(ICorDebugModule *pModule, std::vector<Store> &stores);
+    HRESULT FindMatchOnThread(StoreRef &ref, ICorDebugFrame *pFrame, CORDB_ADDRESS exceptionAddress, bool stoppedThread,
                               std::string &text);
-    HRESULT ReadStoreOnThread(StoreRef &store, ICorDebugThread *pThread, CORDB_ADDRESS exceptionAddress, bool stoppedThread,
-                              std::string &text);
-    HRESULT SearchOtherThreads(StoreRef &store, ICorDebugThread *pStoppedThread, CORDB_ADDRESS exceptionAddress,
+    HRESULT ReadStoreOnThread(StoreRef &ref, ICorDebugFrame *pFrame, DWORD threadId, CORDB_ADDRESS exceptionAddress,
+                              bool stoppedThread, std::string &text, HRESULT *pReadStatus = nullptr);
+    void GetOtherThreads(ICorDebugThread *pStoppedThread, std::vector<OtherThread> &threads);
+    HRESULT SearchOtherThreads(StoreRef &ref, std::vector<OtherThread> &threads, CORDB_ADDRESS exceptionAddress,
                                std::string &suffix);
 };
 

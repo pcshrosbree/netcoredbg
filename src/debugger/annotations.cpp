@@ -12,6 +12,10 @@
 #include "utils/logger.h"
 #include "utils/utf.h"
 
+// Like IfFailRet, but without the error log. In the reader a failed read is an expected outcome (for example a store
+// whose class was never loaded, on every thread at every stop): the store is skipped for that thread, quietly.
+#define IfFailRetQuiet(EXPR) do { Status = (EXPR); if (FAILED(Status)) { return Status; } } while (0)
+
 namespace netcoredbg
 {
 
@@ -34,7 +38,7 @@ namespace
     {
         HRESULT Status;
         ToRelease<IUnknown> pMDUnknown;
-        IfFailRet(pModule->GetMetaDataInterface(IID_IMetaDataImport, &pMDUnknown));
+        IfFailRetQuiet(pModule->GetMetaDataInterface(IID_IMetaDataImport, &pMDUnknown));
         return pMDUnknown->QueryInterface(IID_IMetaDataImport, (LPVOID*) ppMD);
     }
 
@@ -62,7 +66,7 @@ namespace
 
     bool HasTypeInitializer(IMetaDataImport *pMD, mdTypeDef typeToken)
     {
-        HCORENUM hEnum = NULL;
+        HCORENUM hEnum = nullptr;
         mdMethodDef methodDef = mdMethodDefNil;
         ULONG count = 0;
         HRESULT Status = pMD->EnumMethodsWithName(&hEnum, typeToken, W(".cctor"), &methodDef, 1, &count);
@@ -76,7 +80,7 @@ namespace
         ToRelease<IMetaDataImport2> pMD2;
         if (FAILED(pMD->QueryInterface(IID_IMetaDataImport2, (LPVOID*) &pMD2)))
             return true;
-        HCORENUM hEnum = NULL;
+        HCORENUM hEnum = nullptr;
         mdGenericParam genericParam = mdGenericParamNil;
         ULONG count = 0;
         HRESULT Status = pMD2->EnumGenericParams(&hEnum, typeToken, &genericParam, 1, &count);
@@ -84,12 +88,28 @@ namespace
         return FAILED(Status) || count != 0;
     }
 
+    bool IsSealed(IMetaDataImport *pMD, mdTypeDef typeToken)
+    {
+        DWORD typeAttr = 0;
+        if (FAILED(pMD->GetTypeDefProps(typeToken, nullptr, 0, nullptr, &typeAttr, nullptr)))
+            return false;
+        return (typeAttr & tdSealed) != 0;
+    }
+
+    // [ThreadStatic] is a custom attribute; it is not part of the field signature.
+    bool IsThreadStatic(IMetaDataImport *pMD, mdFieldDef fieldToken)
+    {
+        const void *pData = nullptr;
+        ULONG dataSize = 0;
+        return pMD->GetCustomAttributeByName(fieldToken, W("System.ThreadStaticAttribute"), &pData, &dataSize) == S_OK;
+    }
+
     // Finds a field by name; it must be static (or an instance field) as asked, and not a literal.
     HRESULT FindField(IMetaDataImport *pMD, mdTypeDef typeToken, const WCHAR *name, bool isStatic,
                       mdFieldDef &fieldToken, PCCOR_SIGNATURE &sigBlob, ULONG &sigSize)
     {
         HRESULT Status;
-        HCORENUM hEnum = NULL;
+        HCORENUM hEnum = nullptr;
         ULONG count = 0;
         fieldToken = mdFieldDefNil;
         Status = pMD->EnumFieldsWithName(&hEnum, typeToken, name, &fieldToken, 1, &count);
@@ -98,8 +118,8 @@ namespace
             return E_FAIL;
 
         DWORD fieldAttr = 0;
-        IfFailRet(pMD->GetFieldProps(fieldToken, nullptr, nullptr, 0, nullptr, &fieldAttr, &sigBlob, &sigSize,
-                                     nullptr, nullptr, nullptr));
+        IfFailRetQuiet(pMD->GetFieldProps(fieldToken, nullptr, nullptr, 0, nullptr, &fieldAttr, &sigBlob, &sigSize,
+                                          nullptr, nullptr, nullptr));
         if (((fieldAttr & fdStatic) != 0) != isStatic || (fieldAttr & fdLiteral) != 0)
             return E_FAIL;
         return S_OK;
@@ -121,7 +141,11 @@ namespace
         }
         if (pToken != nullptr)
         {
+            // A compressed token takes 1, 2 or 4 bytes (ECMA-335 II.23.2); never read past the blob.
             if (sigBlob >= sigEnd)
+                return false;
+            const ptrdiff_t tokenSize = (*sigBlob & 0x80) == 0 ? 1 : (*sigBlob & 0xC0) == 0x80 ? 2 : (*sigBlob & 0xE0) == 0xC0 ? 4 : 0;
+            if (tokenSize == 0 || sigEnd - sigBlob < tokenSize)
                 return false;
             sigBlob += CorSigUncompressToken(sigBlob, pToken);
         }
@@ -203,6 +227,12 @@ namespace
             whyNot = "it has no nested Entry type";
             return E_FAIL;
         }
+        // Entry is sealed, so an entry is exactly the store's own Entry and its fields are the ones validated here.
+        if (!IsSealed(pMD, entryToken))
+        {
+            whyNot = "its Entry type is not sealed";
+            return E_FAIL;
+        }
 
         mdFieldDef ringField, countField, valueField, exceptionField;
         PCCOR_SIGNATURE ringSig, countSig, valueSig, exceptionSig;
@@ -213,6 +243,14 @@ namespace
             FAILED(FindField(pMD, entryToken, W("Exception"), false, exceptionField, exceptionSig, exceptionSigSize)))
         {
             whyNot = "a contract field is missing";
+            return E_FAIL;
+        }
+
+        // The ring is per thread. An ordinary static of the same name and type would be one ring for the whole
+        // process, and an entry recorded on one thread would read as recorded on every thread.
+        if (!IsThreadStatic(pMD, ringField) || !IsThreadStatic(pMD, countField))
+        {
+            whyNot = "its fields are not [ThreadStatic]";
             return E_FAIL;
         }
 
@@ -237,9 +275,9 @@ namespace
     {
         HRESULT Status;
         ToRelease<ICorDebugReferenceValue> pRef;
-        IfFailRet(pValue->QueryInterface(IID_ICorDebugReferenceValue, (LPVOID*) &pRef));
+        IfFailRetQuiet(pValue->QueryInterface(IID_ICorDebugReferenceValue, (LPVOID*) &pRef));
         BOOL isNull = TRUE;
-        IfFailRet(pRef->IsNull(&isNull));
+        IfFailRetQuiet(pRef->IsNull(&isNull));
         if (isNull)
             return S_FALSE;
         return pRef->GetValue(pAddress);
@@ -249,13 +287,13 @@ namespace
     {
         HRESULT Status;
         ToRelease<ICorDebugValue> pPlain;
-        IfFailRet(DereferenceAndUnboxValue(pValue, &pPlain, nullptr));
+        IfFailRetQuiet(DereferenceAndUnboxValue(pValue, &pPlain, nullptr));
         ULONG32 size = 0;
-        IfFailRet(pPlain->GetSize(&size));
+        IfFailRetQuiet(pPlain->GetSize(&size));
         if (size != sizeof(uint32_t))
             return E_FAIL;
         ToRelease<ICorDebugGenericValue> pGeneric;
-        IfFailRet(pPlain->QueryInterface(IID_ICorDebugGenericValue, (LPVOID*) &pGeneric));
+        IfFailRetQuiet(pPlain->QueryInterface(IID_ICorDebugGenericValue, (LPVOID*) &pGeneric));
         return pGeneric->GetValue(&result);
     }
 
@@ -265,14 +303,63 @@ namespace
         return length >= 1 && length <= 64 && (length & (length - 1)) == 0;
     }
 
-    // A string is shown verbatim (truncated), anything else as `{TypeName}`. Never formats by running code: no
-    // ToString(), no [DebuggerDisplay], no type proxy.
+    bool IsHighSurrogate(uint32_t unit) { return unit >= 0xD800 && unit <= 0xDBFF; }
+    bool IsLowSurrogate(uint32_t unit) { return unit >= 0xDC00 && unit <= 0xDFFF; }
+
+    // UTF-16 to UTF-8 by explicit length; never throws. An embedded NUL is kept (the description is a JSON string,
+    // which carries it as \u0000), and an unpaired surrogate becomes U+FFFD. (to_utf8 stops at the first NUL and
+    // throws std::range_error on an unpaired surrogate, and a .NET string may contain both.)
+    std::string Utf16ToUtf8(const WCHAR *units, size_t count)
+    {
+        std::string out;
+        out.reserve(count);
+        for (size_t i = 0; i < count; i++)
+        {
+            uint32_t cp = units[i];
+            if (IsHighSurrogate(cp) && i + 1 < count && IsLowSurrogate(units[i + 1]))
+            {
+                cp = 0x10000 + ((cp - 0xD800) << 10) + (uint32_t(units[i + 1]) - 0xDC00);
+                i++;
+            }
+            else if (IsHighSurrogate(cp) || IsLowSurrogate(cp))
+            {
+                cp = 0xFFFD;
+            }
+
+            if (cp < 0x80)
+            {
+                out += char(cp);
+            }
+            else if (cp < 0x800)
+            {
+                out += char(0xC0 | (cp >> 6));
+                out += char(0x80 | (cp & 0x3F));
+            }
+            else if (cp < 0x10000)
+            {
+                out += char(0xE0 | (cp >> 12));
+                out += char(0x80 | ((cp >> 6) & 0x3F));
+                out += char(0x80 | (cp & 0x3F));
+            }
+            else
+            {
+                out += char(0xF0 | (cp >> 18));
+                out += char(0x80 | ((cp >> 12) & 0x3F));
+                out += char(0x80 | ((cp >> 6) & 0x3F));
+                out += char(0x80 | (cp & 0x3F));
+            }
+        }
+        return out;
+    }
+
+    // A string is shown verbatim, truncated after MaxAnnotationLength code units (never inside a surrogate pair);
+    // anything else as `{TypeName}`. Never formats by running code: no ToString(), no [DebuggerDisplay], no type proxy.
     HRESULT RenderValue(ICorDebugValue *pValue, std::string &text)
     {
         HRESULT Status;
         ToRelease<ICorDebugValue> pPlain;
         BOOL isNull = FALSE;
-        IfFailRet(DereferenceAndUnboxValue(pValue, &pPlain, &isNull));
+        IfFailRetQuiet(DereferenceAndUnboxValue(pValue, &pPlain, &isNull));
         if (isNull)
             return E_FAIL;
 
@@ -280,20 +367,23 @@ namespace
         if (SUCCEEDED(pPlain->QueryInterface(IID_ICorDebugStringValue, (LPVOID*) &pString)))
         {
             ULONG32 length = 0;
-            IfFailRet(pString->GetLength(&length));
-            const ULONG32 shown = std::min(length, MaxAnnotationLength);
-            std::vector<WCHAR> buffer(shown + 1, 0);
-            ULONG32 returned = 0;
-            IfFailRet(pString->GetString(shown + 1, &returned, buffer.data()));
-            buffer[shown] = 0;
-            text = to_utf8(buffer.data());
+            IfFailRetQuiet(pString->GetLength(&length));
+            // One unit past the limit, to see a surrogate pair that straddles it.
+            const ULONG32 wanted = std::min(length, MaxAnnotationLength + 1);
+            std::vector<WCHAR> buffer(wanted + 1, 0);
+            ULONG32 fullLength = 0;
+            IfFailRetQuiet(pString->GetString(wanted + 1, &fullLength, buffer.data()));
+            ULONG32 shown = std::min(length, MaxAnnotationLength);
+            if (shown < length && shown > 0 && IsHighSurrogate(buffer[shown - 1]) && IsLowSurrogate(buffer[shown]))
+                shown--;
+            text = Utf16ToUtf8(buffer.data(), shown);
             if (shown < length)
                 text += "...";
             return S_OK;
         }
 
         std::string typeName;
-        IfFailRet(TypePrinter::GetTypeOfValue(pValue, typeName));
+        IfFailRetQuiet(TypePrinter::GetTypeOfValue(pValue, typeName));
         text = "{" + typeName + "}";
         return S_OK;
     }
@@ -301,6 +391,7 @@ namespace
     // Any managed frame of the thread: the runtime uses the frame of a thread-static read only to identify the thread.
     HRESULT GetAnyManagedFrame(ICorDebugThread *pThread, ICorDebugFrame **ppFrame)
     {
+        *ppFrame = nullptr;
         ToRelease<ICorDebugFrame> pActiveFrame;
         ToRelease<ICorDebugILFrame> pILFrame;
         if (SUCCEEDED(pThread->GetActiveFrame(&pActiveFrame)) && pActiveFrame != nullptr &&
@@ -319,10 +410,21 @@ namespace
             *ppFrame = pFrame;
             return E_ABORT; // Fast exit from cycle.
         });
-        LOGI("Annotations: thread %u has no active managed frame; stack walk %s", (unsigned)GetThreadOSId(pThread),
-             *ppFrame != nullptr ? "found one" : "found none");
 
         return *ppFrame != nullptr ? S_OK : E_FAIL;
+    }
+
+    const char *ReadOutcome(HRESULT status)
+    {
+        if (status == S_OK)
+            return "match";
+        if (status == S_FALSE)
+            return "no match";
+        if (status == CORDBG_E_STATIC_VAR_NOT_AVAILABLE)
+            return "no storage (never recorded)";
+        if (status == CORDBG_E_CLASS_NOT_LOADED)
+            return "class not loaded";
+        return "skipped";
     }
 
 } // unnamed namespace
@@ -331,7 +433,13 @@ void Annotations::SetOptions(bool enable, const std::vector<std::string> &extraS
 {
     std::lock_guard<std::mutex> lock(m_mutex);
     m_enabled = enable;
-    m_extraStoreNames = extraStoreNames;
+    m_extraStoreNames.clear();
+    for (const auto &name : extraStoreNames)
+    {
+        if (name != DefaultStoreName &&
+            std::find(m_extraStoreNames.begin(), m_extraStoreNames.end(), name) == m_extraStoreNames.end())
+            m_extraStoreNames.push_back(name);
+    }
     m_threadLimit = threadLimit;
     for (auto &module : m_modules)
     {
@@ -339,7 +447,7 @@ void Annotations::SetOptions(bool enable, const std::vector<std::string> &extraS
         module.second.stores.clear();
     }
     LOGI("Annotations: %s, %zu extra store name(s), thread limit %u", enable ? "enabled" : "disabled",
-         extraStoreNames.size(), threadLimit);
+         m_extraStoreNames.size(), threadLimit);
 }
 
 void Annotations::ManagedCallbackLoadModule(ICorDebugModule *pModule, bool isCoreLib)
@@ -379,12 +487,12 @@ void Annotations::Cleanup()
     m_nextOrdinal = 1;
 }
 
-// Caller must hold m_mutex.
-void Annotations::ScanModule(ICorDebugModule *pModule, std::vector<Store> &stores)
+// Caller must hold m_mutex. Returns false if the module's metadata could not be read (scan again at the next stop).
+bool Annotations::ScanModule(ICorDebugModule *pModule, std::vector<Store> &stores)
 {
     ToRelease<IMetaDataImport> pMD;
     if (FAILED(GetMetaDataImport(pModule, &pMD)))
-        return;
+        return false;
 
     std::vector<std::string> names{DefaultStoreName};
     names.insert(names.end(), m_extraStoreNames.begin(), m_extraStoreNames.end());
@@ -393,6 +501,8 @@ void Annotations::ScanModule(ICorDebugModule *pModule, std::vector<Store> &store
     {
         mdTypeDef holderToken = FindTypeByName(pMD, name);
         if (holderToken == mdTypeDefNil)
+            continue;
+        if (std::any_of(stores.begin(), stores.end(), [&](const Store &store) { return store.holderToken == holderToken; }))
             continue;
 
         Store store;
@@ -406,6 +516,7 @@ void Annotations::ScanModule(ICorDebugModule *pModule, std::vector<Store> &store
         stores.push_back(store);
         LOGI("Annotations: store %s found (token 0x%08x)", name.c_str(), holderToken);
     }
+    return true;
 }
 
 // Caller must hold m_mutex.
@@ -415,7 +526,7 @@ HRESULT Annotations::GetStores(std::vector<StoreRef> &stores)
 {
     HRESULT Status;
     std::vector<ToRelease<ICorDebugModule>> modules;
-    IfFailRet(m_sharedModules->ForEachModule([&](ICorDebugModule *pModule)
+    IfFailRetQuiet(m_sharedModules->ForEachModule([&](ICorDebugModule *pModule)
     {
         pModule->AddRef();
         modules.emplace_back(pModule);
@@ -431,8 +542,8 @@ HRESULT Annotations::GetStores(std::vector<StoreRef> &stores)
         ModuleStores &module = m_modules[baseAddress];
         if (!module.scanned)
         {
-            ScanModule(pModule, module.stores);
-            module.scanned = true;
+            module.stores.clear();
+            module.scanned = ScanModule(pModule, module.stores);
         }
 
         for (const auto &store : module.stores)
@@ -451,55 +562,42 @@ HRESULT Annotations::GetStores(std::vector<StoreRef> &stores)
     return S_OK;
 }
 
-// Reads one store's ring on one thread. S_OK and the text of the newest entry whose exception is the object at
-// exceptionAddress; S_FALSE if there is none. Fails on any ICorDebug error, including CORDBG_E_STATIC_VAR_NOT_AVAILABLE
-// (no storage for the field on this thread).
-HRESULT Annotations::FindMatchOnThread(StoreRef &ref, ICorDebugThread *pThread, CORDB_ADDRESS exceptionAddress,
+// Reads one store's ring on the thread that pFrame belongs to. S_OK and the text of the newest entry whose exception is
+// the object at exceptionAddress; S_FALSE if there is none. Fails on any ICorDebug error, including
+// CORDBG_E_STATIC_VAR_NOT_AVAILABLE (no storage for the field on this thread).
+HRESULT Annotations::FindMatchOnThread(StoreRef &ref, ICorDebugFrame *pFrame, CORDB_ADDRESS exceptionAddress,
                                        bool stoppedThread, std::string &text)
 {
     HRESULT Status;
     const Store &store = ref.store;
 
-    ToRelease<ICorDebugFrame> pFrame;
-    if (FAILED(GetAnyManagedFrame(pThread, &pFrame)))
-        return S_FALSE; // no managed frame: no thread-static can be read for this thread
-
     ToRelease<ICorDebugClass> pHolderClass;
-    IfFailRet(ref.pModule->GetClassFromToken(store.holderToken, &pHolderClass));
-
-    ++m_ringReads;
-    LOGI("Annotations: ring read %llu: store %s, %s thread %u", (unsigned long long)m_ringReads, store.name.c_str(),
-         stoppedThread ? "stopped" : "other", (unsigned)GetThreadOSId(pThread));
+    IfFailRetQuiet(ref.pModule->GetClassFromToken(store.holderToken, &pHolderClass));
 
     // The DAC looks thread-static storage up without creating it, so this read never allocates in the debuggee.
     ToRelease<ICorDebugValue> pRingValue;
-    Status = pHolderClass->GetStaticFieldValue(store.ringField, pFrame, &pRingValue);
-    if (FAILED(Status))
-        return Status;
+    IfFailRetQuiet(pHolderClass->GetStaticFieldValue(store.ringField, pFrame, &pRingValue));
 
     ToRelease<ICorDebugValue> pRing;
     BOOL isNull = FALSE;
-    IfFailRet(DereferenceAndUnboxValue(pRingValue, &pRing, &isNull));
+    IfFailRetQuiet(DereferenceAndUnboxValue(pRingValue, &pRing, &isNull));
     if (isNull)
         return S_FALSE;
 
     ToRelease<ICorDebugArrayValue> pArray;
-    IfFailRet(pRing->QueryInterface(IID_ICorDebugArrayValue, (LPVOID*) &pArray));
+    IfFailRetQuiet(pRing->QueryInterface(IID_ICorDebugArrayValue, (LPVOID*) &pArray));
     ULONG32 length = 0;
-    IfFailRet(pArray->GetCount(&length));
+    IfFailRetQuiet(pArray->GetCount(&length));
     if (!IsContractRingLength(length))
-    {
-        LOGI("Annotations: store %s ignored: ring length %u is not a power of two in 1..64", store.name.c_str(), length);
-        return S_FALSE;
-    }
+        return S_FALSE; // not contract 1: the store is ignored
 
     ToRelease<ICorDebugValue> pCountValue;
-    IfFailRet(pHolderClass->GetStaticFieldValue(store.countField, pFrame, &pCountValue));
+    IfFailRetQuiet(pHolderClass->GetStaticFieldValue(store.countField, pFrame, &pCountValue));
     uint32_t count = 0; // wraps from 0xFFFFFFFF to 0; read as unsigned
-    IfFailRet(ReadUInt32(pCountValue, count));
+    IfFailRetQuiet(ReadUInt32(pCountValue, count));
 
     ToRelease<ICorDebugClass> pEntryClass;
-    IfFailRet(ref.pModule->GetClassFromToken(store.entryToken, &pEntryClass));
+    IfFailRetQuiet(ref.pModule->GetClassFromToken(store.entryToken, &pEntryClass));
 
     // Visit every slot, newest first. The count only orders the slots; it never says which hold entries (at the wrap,
     // or on a thread stopped between the slot store and the count store, it can't).
@@ -508,31 +606,31 @@ HRESULT Annotations::FindMatchOnThread(StoreRef &ref, ICorDebugThread *pThread, 
         const ULONG32 slot = (count - 1u - k) % length;
 
         ToRelease<ICorDebugValue> pElementValue;
-        IfFailRet(pArray->GetElementAtPosition(slot, &pElementValue));
+        IfFailRetQuiet(pArray->GetElementAtPosition(slot, &pElementValue));
         ToRelease<ICorDebugValue> pElement;
         isNull = FALSE;
-        IfFailRet(DereferenceAndUnboxValue(pElementValue, &pElement, &isNull));
+        IfFailRetQuiet(DereferenceAndUnboxValue(pElementValue, &pElement, &isNull));
         if (isNull)
             continue;
 
-        // Defensive: with a validated Entry?[] ring nothing else can be in a slot.
+        // Defensive: with a validated Entry?[] ring and a sealed Entry nothing else can be in a slot.
         ToRelease<ICorDebugObjectValue> pEntry;
-        IfFailRet(pElement->QueryInterface(IID_ICorDebugObjectValue, (LPVOID*) &pEntry));
+        IfFailRetQuiet(pElement->QueryInterface(IID_ICorDebugObjectValue, (LPVOID*) &pEntry));
         ToRelease<ICorDebugClass> pElementClass;
-        IfFailRet(pEntry->GetClass(&pElementClass));
+        IfFailRetQuiet(pEntry->GetClass(&pElementClass));
         mdTypeDef elementToken = mdTypeDefNil;
-        IfFailRet(pElementClass->GetToken(&elementToken));
+        IfFailRetQuiet(pElementClass->GetToken(&elementToken));
         ToRelease<ICorDebugModule> pElementModule;
-        IfFailRet(pElementClass->GetModule(&pElementModule));
+        IfFailRetQuiet(pElementClass->GetModule(&pElementModule));
         CORDB_ADDRESS elementModuleAddress = 0;
-        IfFailRet(pElementModule->GetBaseAddress(&elementModuleAddress));
+        IfFailRetQuiet(pElementModule->GetBaseAddress(&elementModuleAddress));
         if (elementToken != store.entryToken || elementModuleAddress != ref.moduleAddress)
             continue;
 
         ToRelease<ICorDebugValue> pEntryException;
-        IfFailRet(pEntry->GetFieldValue(pEntryClass, store.exceptionField, &pEntryException));
+        IfFailRetQuiet(pEntry->GetFieldValue(pEntryClass, store.exceptionField, &pEntryException));
         CORDB_ADDRESS entryExceptionAddress = 0;
-        IfFailRet(Status = GetObjectAddress(pEntryException, &entryExceptionAddress));
+        IfFailRetQuiet(GetObjectAddress(pEntryException, &entryExceptionAddress));
         if (Status == S_FALSE)
             continue; // an annotation not tied to an exception is never attributed to an exception stop
 
@@ -542,13 +640,13 @@ HRESULT Annotations::FindMatchOnThread(StoreRef &ref, ICorDebugThread *pThread, 
             continue;
 
         ToRelease<ICorDebugValue> pEntryValue;
-        IfFailRet(pEntry->GetFieldValue(pEntryClass, store.valueField, &pEntryValue));
+        IfFailRetQuiet(pEntry->GetFieldValue(pEntryClass, store.valueField, &pEntryValue));
         CORDB_ADDRESS valueAddress = 0;
-        IfFailRet(Status = GetObjectAddress(pEntryValue, &valueAddress));
+        IfFailRetQuiet(GetObjectAddress(pEntryValue, &valueAddress));
         if (Status == S_FALSE)
             continue; // defensive: no conforming producer stores a null value
 
-        IfFailRet(RenderValue(pEntryValue, text));
+        IfFailRetQuiet(RenderValue(pEntryValue, text));
         return S_OK;
     }
 
@@ -557,37 +655,35 @@ HRESULT Annotations::FindMatchOnThread(StoreRef &ref, ICorDebugThread *pThread, 
 
 // FindMatchOnThread that never fails: an ICorDebug error while reading a store skips that store for this thread,
 // and CORDBG_E_STATIC_VAR_NOT_AVAILABLE means the thread has no storage for the ring, which for a holder without a
-// static constructor means it never recorded. Neither may fail or delay the exception report.
-HRESULT Annotations::ReadStoreOnThread(StoreRef &ref, ICorDebugThread *pThread, CORDB_ADDRESS exceptionAddress,
-                                       bool stoppedThread, std::string &text)
+// static constructor means it never recorded. Neither may fail or delay the exception report. Every call is one ring
+// read, and is logged as one (the log is how a test sees when the reader reads).
+HRESULT Annotations::ReadStoreOnThread(StoreRef &ref, ICorDebugFrame *pFrame, DWORD threadId,
+                                       CORDB_ADDRESS exceptionAddress, bool stoppedThread, std::string &text,
+                                       HRESULT *pReadStatus)
 {
-    HRESULT Status = FindMatchOnThread(ref, pThread, exceptionAddress, stoppedThread, text);
+    HRESULT Status = FindMatchOnThread(ref, pFrame, exceptionAddress, stoppedThread, text);
+    if (pReadStatus != nullptr)
+        *pReadStatus = Status;
+
+    ++m_ringReads;
+    LOGI("Annotations: ring read %llu: store %s, %s thread %u: %s", (unsigned long long)m_ringReads,
+         ref.store.name.c_str(), stoppedThread ? "stopped" : "other", (unsigned)threadId, ReadOutcome(Status));
+
     if (SUCCEEDED(Status))
         return Status;
-    if (Status == CORDBG_E_STATIC_VAR_NOT_AVAILABLE)
-        LOGI("Annotations: store %s: thread %u never recorded (no storage)", ref.store.name.c_str(),
-             (unsigned)GetThreadOSId(pThread));
-    else
-        LOGI("Annotations: store %s skipped on thread %u: %s", ref.store.name.c_str(), (unsigned)GetThreadOSId(pThread),
-             errormessage(Status));
     return S_FALSE;
 }
 
-// An exception rethrown on another thread (`await`, ExceptionDispatchInfo.Throw) is the same object, so its annotation
-// can be in the ring of the thread that recorded it. Best effort: that thread must still be alive, have a managed frame
-// and not have evicted the entry. Each match is labelled with the thread it was recorded on.
-HRESULT Annotations::SearchOtherThreads(StoreRef &ref, ICorDebugThread *pStoppedThread, CORDB_ADDRESS exceptionAddress,
-                                        std::string &suffix)
+// Caller must hold m_mutex. The managed threads other than the stopped one, each with any managed frame of it;
+// threads without one are left out (no thread-static of theirs can be read).
+void Annotations::GetOtherThreads(ICorDebugThread *pStoppedThread, std::vector<OtherThread> &threads)
 {
-    HRESULT Status;
     const DWORD stoppedThreadId = GetThreadOSId(pStoppedThread);
-
     ToRelease<ICorDebugProcess> pProcess;
     ToRelease<ICorDebugThreadEnum> pThreadEnum;
     if (FAILED(pStoppedThread->GetProcess(&pProcess)) || FAILED(pProcess->EnumerateThreads(&pThreadEnum)))
-        return S_OK; // nothing to search; never fails the report
+        return;
 
-    unsigned searched = 0;
     ICorDebugThread *pRawThread = nullptr;
     ULONG fetched = 0;
     while (SUCCEEDED(pThreadEnum->Next(1, &pRawThread, &fetched)) && fetched == 1)
@@ -596,23 +692,41 @@ HRESULT Annotations::SearchOtherThreads(StoreRef &ref, ICorDebugThread *pStopped
         const DWORD threadId = GetThreadOSId(pThread);
         if (threadId == stoppedThreadId)
             continue;
+        OtherThread other;
+        if (FAILED(GetAnyManagedFrame(pThread, &other.pFrame)))
+            continue;
+        other.threadId = threadId;
+        threads.push_back(std::move(other));
+    }
+}
+
+// An exception rethrown on another thread (`await`, ExceptionDispatchInfo.Throw) is the same object, so its annotation
+// can be in the ring of the thread that recorded it. Best effort: that thread must still be alive, have a managed frame
+// and not have evicted the entry. Each match is labelled with the thread it was recorded on.
+HRESULT Annotations::SearchOtherThreads(StoreRef &ref, std::vector<OtherThread> &threads, CORDB_ADDRESS exceptionAddress,
+                                        std::string &suffix)
+{
+    HRESULT Status;
+    unsigned searched = 0;
+    for (auto &other : threads)
+    {
         if (m_threadLimit != 0 && searched >= m_threadLimit)
             break;
         searched++;
 
         std::string text;
-        IfFailRet(ReadStoreOnThread(ref, pThread, exceptionAddress, false, text));
+        IfFailRetQuiet(ReadStoreOnThread(ref, other.pFrame, other.threadId, exceptionAddress, false, text));
         if (Status == S_OK)
-            suffix += "\n Annotation (recorded on thread " + std::to_string(threadId) + "): " + text;
+            suffix += "\n Annotation (recorded on thread " + std::to_string(other.threadId) + "): " + text;
     }
 
     return S_OK;
 }
 
-HRESULT Annotations::AppendExceptionAnnotations(ICorDebugThread *pThread, ExceptionInfo &exceptionInfo)
+// Caller must hold m_mutex.
+HRESULT Annotations::AppendExceptionAnnotationsImpl(ICorDebugThread *pThread, ExceptionInfo &exceptionInfo)
 {
     HRESULT Status;
-    std::lock_guard<std::mutex> lock(m_mutex);
     if (!m_enabled)
         return S_OK;
 
@@ -636,26 +750,62 @@ HRESULT Annotations::AppendExceptionAnnotations(ICorDebugThread *pThread, Except
     if (FAILED(GetStores(stores)))
         return S_OK;
 
+    ToRelease<ICorDebugFrame> pFrame;
+    const bool stoppedThreadHasFrame = SUCCEEDED(GetAnyManagedFrame(pThread, &pFrame));
+    std::vector<OtherThread> otherThreads;
+    bool otherThreadsListed = false;
+
     std::string suffix;
     for (auto &ref : stores)
     {
         // The stopped thread first. The preference is per store: a match in one store never suppresses another.
-        std::string text;
-        IfFailRet(ReadStoreOnThread(ref, pThread, exceptionAddress, true, text));
-        if (Status == S_OK)
+        HRESULT readStatus = S_FALSE;
+        if (stoppedThreadHasFrame)
         {
-            suffix += "\n Annotation: " + text;
-            continue;
+            std::string text;
+            IfFailRetQuiet(ReadStoreOnThread(ref, pFrame, threadId, exceptionAddress, true, text, &readStatus));
+            if (Status == S_OK)
+            {
+                suffix += "\n Annotation: " + text;
+                continue;
+            }
         }
 
-        IfFailRet(SearchOtherThreads(ref, pThread, exceptionAddress, suffix));
-    }
+        // A holder class the runtime never loaded has no storage on any thread: nothing to search.
+        if (readStatus == CORDBG_E_CLASS_NOT_LOADED)
+            continue;
 
-    LOGI("Annotations: %zu store(s), %zu annotation line(s) for thread %u, %llu ring read(s) so far", stores.size(),
-         (size_t)std::count(suffix.begin(), suffix.end(), '\n'), (unsigned)threadId, (unsigned long long)m_ringReads);
+        if (!otherThreadsListed)
+        {
+            GetOtherThreads(pThread, otherThreads);
+            otherThreadsListed = true;
+        }
+        IfFailRetQuiet(SearchOtherThreads(ref, otherThreads, exceptionAddress, suffix));
+    }
 
     m_stopCache[threadId] = suffix;
     exceptionInfo.description += suffix;
+    return S_OK;
+}
+
+HRESULT Annotations::AppendExceptionAnnotations(ICorDebugThread *pThread, ExceptionInfo &exceptionInfo)
+{
+    // Nothing here may fail or delay the exception report: on any C++ exception, the description is left as it was.
+    const std::string description = exceptionInfo.description;
+    try
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        return AppendExceptionAnnotationsImpl(pThread, exceptionInfo);
+    }
+    catch (const std::exception &e)
+    {
+        LOGE("Annotations: reader failed: %s", e.what());
+    }
+    catch (...)
+    {
+        LOGE("Annotations: reader failed");
+    }
+    exceptionInfo.description = description;
     return S_OK;
 }
 
