@@ -3,6 +3,7 @@
 // See the LICENSE file in the project root for more information.
 #pragma once
 
+#include <cstdint>
 #include <string>
 #include <vector>
 
@@ -25,7 +26,14 @@ typedef std::wstring WSTRING;
 typedef std::u16string WSTRING;
 #endif
 
+inline bool IsUtf16HighSurrogate(uint32_t unit) { return unit >= 0xD800 && unit <= 0xDBFF; }
+inline bool IsUtf16LowSurrogate(uint32_t unit) { return unit >= 0xDC00 && unit <= 0xDFFF; }
+
 std::string to_utf8(const WCHAR *wstr);
+// Converts exactly `length` UTF-16 code units: an embedded NUL is kept, and an unpaired surrogate becomes U+FFFD, so
+// the result is always valid UTF-8. Throws nothing but std::bad_alloc (to_utf8(const WCHAR*) stops at the first NUL
+// and throws std::range_error on an unpaired surrogate).
+std::string to_utf8(const WCHAR *wstr, size_t length);
 WSTRING to_utf16(const std::string &utf8);
 std::string to_utf8(WCHAR wch);
 

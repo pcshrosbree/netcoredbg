@@ -12,9 +12,8 @@
 #include "utils/logger.h"
 #include "utils/utf.h"
 
-// Like IfFailRet, but without the error log. In the reader a failed read is an expected outcome (for example a store
-// whose class was never loaded, on every thread at every stop): the store is skipped for that thread, quietly.
-#define IfFailRetQuiet(EXPR) do { Status = (EXPR); if (FAILED(Status)) { return Status; } } while (0)
+// Reads below use IfFailRetQuiet, not IfFailRet: in the reader a failed read is an expected outcome (for example a
+// store whose class was never loaded, on every thread at every stop), and the store is skipped for that thread quietly.
 
 namespace netcoredbg
 {
@@ -303,55 +302,6 @@ namespace
         return length >= 1 && length <= 64 && (length & (length - 1)) == 0;
     }
 
-    bool IsHighSurrogate(uint32_t unit) { return unit >= 0xD800 && unit <= 0xDBFF; }
-    bool IsLowSurrogate(uint32_t unit) { return unit >= 0xDC00 && unit <= 0xDFFF; }
-
-    // UTF-16 to UTF-8 by explicit length; never throws. An embedded NUL is kept (the description is a JSON string,
-    // which carries it as \u0000), and an unpaired surrogate becomes U+FFFD. (to_utf8 stops at the first NUL and
-    // throws std::range_error on an unpaired surrogate, and a .NET string may contain both.)
-    std::string Utf16ToUtf8(const WCHAR *units, size_t count)
-    {
-        std::string out;
-        out.reserve(count);
-        for (size_t i = 0; i < count; i++)
-        {
-            uint32_t cp = units[i];
-            if (IsHighSurrogate(cp) && i + 1 < count && IsLowSurrogate(units[i + 1]))
-            {
-                cp = 0x10000 + ((cp - 0xD800) << 10) + (uint32_t(units[i + 1]) - 0xDC00);
-                i++;
-            }
-            else if (IsHighSurrogate(cp) || IsLowSurrogate(cp))
-            {
-                cp = 0xFFFD;
-            }
-
-            if (cp < 0x80)
-            {
-                out += char(cp);
-            }
-            else if (cp < 0x800)
-            {
-                out += char(0xC0 | (cp >> 6));
-                out += char(0x80 | (cp & 0x3F));
-            }
-            else if (cp < 0x10000)
-            {
-                out += char(0xE0 | (cp >> 12));
-                out += char(0x80 | ((cp >> 6) & 0x3F));
-                out += char(0x80 | (cp & 0x3F));
-            }
-            else
-            {
-                out += char(0xF0 | (cp >> 18));
-                out += char(0x80 | ((cp >> 12) & 0x3F));
-                out += char(0x80 | ((cp >> 6) & 0x3F));
-                out += char(0x80 | (cp & 0x3F));
-            }
-        }
-        return out;
-    }
-
     // A string is shown verbatim, truncated after MaxAnnotationLength code units (never inside a surrogate pair);
     // anything else as `{TypeName}`. Never formats by running code: no ToString(), no [DebuggerDisplay], no type proxy.
     HRESULT RenderValue(ICorDebugValue *pValue, std::string &text)
@@ -374,9 +324,9 @@ namespace
             ULONG32 fullLength = 0;
             IfFailRetQuiet(pString->GetString(wanted + 1, &fullLength, buffer.data()));
             ULONG32 shown = std::min(length, MaxAnnotationLength);
-            if (shown < length && shown > 0 && IsHighSurrogate(buffer[shown - 1]) && IsLowSurrogate(buffer[shown]))
+            if (shown < length && shown > 0 && IsUtf16HighSurrogate(buffer[shown - 1]) && IsUtf16LowSurrogate(buffer[shown]))
                 shown--;
-            text = Utf16ToUtf8(buffer.data(), shown);
+            text = to_utf8(buffer.data(), shown);
             if (shown < length)
                 text += "...";
             return S_OK;
@@ -674,8 +624,8 @@ HRESULT Annotations::ReadStoreOnThread(StoreRef &ref, ICorDebugFrame *pFrame, DW
     return S_FALSE;
 }
 
-// Caller must hold m_mutex. The managed threads other than the stopped one, each with any managed frame of it;
-// threads without one are left out (no thread-static of theirs can be read).
+// Caller must hold m_mutex. The threads other than the stopped one, in ICorDebugProcess::EnumerateThreads order. Their
+// frames are found later, only as the search needs them (GetOtherThreadFrame).
 void Annotations::GetOtherThreads(ICorDebugThread *pStoppedThread, std::vector<OtherThread> &threads)
 {
     const DWORD stoppedThreadId = GetThreadOSId(pStoppedThread);
@@ -688,31 +638,45 @@ void Annotations::GetOtherThreads(ICorDebugThread *pStoppedThread, std::vector<O
     ULONG fetched = 0;
     while (SUCCEEDED(pThreadEnum->Next(1, &pRawThread, &fetched)) && fetched == 1)
     {
-        ToRelease<ICorDebugThread> pThread(pRawThread);
-        const DWORD threadId = GetThreadOSId(pThread);
-        if (threadId == stoppedThreadId)
-            continue;
         OtherThread other;
-        if (FAILED(GetAnyManagedFrame(pThread, &other.pFrame)))
+        other.pThread = pRawThread;
+        other.threadId = GetThreadOSId(pRawThread);
+        if (other.threadId == stoppedThreadId)
             continue;
-        other.threadId = threadId;
         threads.push_back(std::move(other));
     }
+}
+
+// Any managed frame of the thread, found once per stop and kept for the other stores. False if it has none.
+bool Annotations::GetOtherThreadFrame(OtherThread &other)
+{
+    if (other.frameState == OtherThread::FrameUnknown)
+        other.frameState = SUCCEEDED(GetAnyManagedFrame(other.pThread, &other.pFrame)) ? OtherThread::FrameFound
+                                                                                         : OtherThread::FrameNone;
+    return other.frameState == OtherThread::FrameFound;
 }
 
 // An exception rethrown on another thread (`await`, ExceptionDispatchInfo.Throw) is the same object, so its annotation
 // can be in the ring of the thread that recorded it. Best effort: that thread must still be alive, have a managed frame
 // and not have evicted the entry. Each match is labelled with the thread it was recorded on.
+//
+// The thread limit (exceptionAnnotationThreadLimit, N; 0 means no limit) applies per store and per stop: for each store
+// the reader visits the other threads in EnumerateThreads order and reads the ring of at most N of them. A thread counts
+// toward N when it has a managed frame, so its ring is read, whatever the read finds (a match, no match, or no storage);
+// a thread without a managed frame cannot be read and does not count. Frames are looked up lazily, so with a limit the
+// lookups stop once N threads with a frame are found, and the same N are reused for every store at this stop.
 HRESULT Annotations::SearchOtherThreads(StoreRef &ref, std::vector<OtherThread> &threads, CORDB_ADDRESS exceptionAddress,
                                         std::string &suffix)
 {
     HRESULT Status;
-    unsigned searched = 0;
+    unsigned read = 0;
     for (auto &other : threads)
     {
-        if (m_threadLimit != 0 && searched >= m_threadLimit)
+        if (m_threadLimit != 0 && read >= m_threadLimit)
             break;
-        searched++;
+        if (!GetOtherThreadFrame(other))
+            continue;
+        read++;
 
         std::string text;
         IfFailRetQuiet(ReadStoreOnThread(ref, other.pFrame, other.threadId, exceptionAddress, false, text));
@@ -723,8 +687,8 @@ HRESULT Annotations::SearchOtherThreads(StoreRef &ref, std::vector<OtherThread> 
     return S_OK;
 }
 
-// Caller must hold m_mutex.
-HRESULT Annotations::AppendExceptionAnnotationsImpl(ICorDebugThread *pThread, ExceptionInfo &exceptionInfo)
+// Caller must hold m_mutex. Builds the text to append to the description in `suffix`.
+HRESULT Annotations::AppendExceptionAnnotationsImpl(ICorDebugThread *pThread, std::string &suffix)
 {
     HRESULT Status;
     if (!m_enabled)
@@ -734,7 +698,7 @@ HRESULT Annotations::AppendExceptionAnnotationsImpl(ICorDebugThread *pThread, Ex
     auto cached = m_stopCache.find(threadId);
     if (cached != m_stopCache.end())
     {
-        exceptionInfo.description += cached->second;
+        suffix = cached->second;
         return S_OK;
     }
 
@@ -755,7 +719,6 @@ HRESULT Annotations::AppendExceptionAnnotationsImpl(ICorDebugThread *pThread, Ex
     std::vector<OtherThread> otherThreads;
     bool otherThreadsListed = false;
 
-    std::string suffix;
     for (auto &ref : stores)
     {
         // The stopped thread first. The preference is per store: a match in one store never suppresses another.
@@ -784,18 +747,24 @@ HRESULT Annotations::AppendExceptionAnnotationsImpl(ICorDebugThread *pThread, Ex
     }
 
     m_stopCache[threadId] = suffix;
-    exceptionInfo.description += suffix;
     return S_OK;
 }
 
 HRESULT Annotations::AppendExceptionAnnotations(ICorDebugThread *pThread, ExceptionInfo &exceptionInfo)
 {
-    // Nothing here may fail or delay the exception report: on any C++ exception, the description is left as it was.
-    const std::string description = exceptionInfo.description;
+    // Nothing here may fail or delay the exception report. Everything that can throw (allocation included) is inside
+    // the try, and the description changes only through the final append, which leaves it unchanged if it throws.
     try
     {
-        std::lock_guard<std::mutex> lock(m_mutex);
-        return AppendExceptionAnnotationsImpl(pThread, exceptionInfo);
+        std::string suffix;
+        HRESULT Status;
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            Status = AppendExceptionAnnotationsImpl(pThread, suffix);
+        }
+        if (FAILED(Status))
+            return Status; // nothing appended
+        exceptionInfo.description.append(suffix);
     }
     catch (const std::exception &e)
     {
@@ -805,7 +774,6 @@ HRESULT Annotations::AppendExceptionAnnotations(ICorDebugThread *pThread, Except
     {
         LOGE("Annotations: reader failed");
     }
-    exceptionInfo.description = description;
     return S_OK;
 }
 

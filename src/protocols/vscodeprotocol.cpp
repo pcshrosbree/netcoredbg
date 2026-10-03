@@ -484,8 +484,10 @@ void VSCodeProtocol::EmitEvent(const std::string &name, const nlohmann::json &bo
 // Debugger annotations shown with exception info (launch and attach options):
 //   "exceptionAnnotations": false                   turn the reader off (default: on);
 //   "exceptionAnnotationStores": ["Ns.Type", ...]   holder types to read besides System.Diagnostics.DebuggerAnnotationStore;
-//   "exceptionAnnotationThreadLimit": N             read at most N other threads per store (default 0: all; a
-//                                                   negative N is treated as 0).
+//   "exceptionAnnotationThreadLimit": N             per store and stop, read the ring of at most N other threads
+//                                                   that have a managed frame (default 0: no limit). An integer
+//                                                   below 0 or above 4294967295 is treated as 0; a fractional
+//                                                   number is truncated; a non-number fails the request.
 static void SetExceptionAnnotations(std::shared_ptr<IDebugger> &sharedDebugger, const json &arguments)
 {
     int64_t threadLimit = arguments.value("exceptionAnnotationThreadLimit", int64_t(0));

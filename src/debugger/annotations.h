@@ -59,7 +59,8 @@ public:
 
     // enable: the reader is on by default. extraStoreNames: holder type names to search besides the default one
     // (namespace-qualified, `+` for nested types; duplicates are ignored); they must satisfy the same contract.
-    // threadLimit: at most this many other threads with a managed frame are read per store and stop (0: all).
+    // threadLimit: per store and per stop, the ring of at most this many other threads is read, in EnumerateThreads
+    // order; a thread counts when it has a managed frame (its ring is read, whatever the read finds). 0: no limit.
     void SetOptions(bool enable, const std::vector<std::string> &extraStoreNames, unsigned threadLimit);
 
     // Stores are ordered by the order modules were observed, so record it as modules load (on attach, the runtime
@@ -107,10 +108,14 @@ private:
         Store store;
     };
 
-    // A thread other than the stopped one, with any managed frame of it (used only to name the thread to the DBI).
+    // A thread other than the stopped one; its managed frame (used only to name the thread to the DBI) is looked up
+    // when first needed, once per stop.
     struct OtherThread
     {
+        enum FrameState { FrameUnknown, FrameFound, FrameNone };
         DWORD threadId = 0;
+        ToRelease<ICorDebugThread> pThread;
+        FrameState frameState = FrameUnknown;
         ToRelease<ICorDebugFrame> pFrame;
     };
 
@@ -127,7 +132,7 @@ private:
     // Every ring read since the session started; written to the log, so a test can see when reads happen.
     uint64_t m_ringReads;
 
-    HRESULT AppendExceptionAnnotationsImpl(ICorDebugThread *pThread, ExceptionInfo &exceptionInfo);
+    HRESULT AppendExceptionAnnotationsImpl(ICorDebugThread *pThread, std::string &suffix);
     HRESULT GetStores(std::vector<StoreRef> &stores);
     bool ScanModule(ICorDebugModule *pModule, std::vector<Store> &stores);
     HRESULT FindMatchOnThread(StoreRef &ref, ICorDebugFrame *pFrame, CORDB_ADDRESS exceptionAddress, bool stoppedThread,
@@ -135,6 +140,7 @@ private:
     HRESULT ReadStoreOnThread(StoreRef &ref, ICorDebugFrame *pFrame, DWORD threadId, CORDB_ADDRESS exceptionAddress,
                               bool stoppedThread, std::string &text, HRESULT *pReadStatus = nullptr);
     void GetOtherThreads(ICorDebugThread *pStoppedThread, std::vector<OtherThread> &threads);
+    bool GetOtherThreadFrame(OtherThread &other);
     HRESULT SearchOtherThreads(StoreRef &ref, std::vector<OtherThread> &threads, CORDB_ADDRESS exceptionAddress,
                                std::string &suffix);
 };

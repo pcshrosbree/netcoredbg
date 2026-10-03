@@ -109,6 +109,11 @@ private:
 #define IfFailRet(EXPR) do { Status = (EXPR); if(FAILED(Status)) { LOGE("%s : 0x%08x", #EXPR, Status); return (Status); } } while (0)
 #endif
 
+// IfFailRet without the error log, for calls whose failure is an expected outcome the caller handles.
+#ifndef IfFailRetQuiet
+#define IfFailRetQuiet(EXPR) do { Status = (EXPR); if(FAILED(Status)) { return (Status); } } while (0)
+#endif
+
 #ifndef _countof
 #define _countof(x) (sizeof(x)/sizeof(x[0]))
 #endif
