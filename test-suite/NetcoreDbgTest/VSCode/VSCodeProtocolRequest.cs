@@ -53,6 +53,9 @@ namespace NetcoreDbgTest.VSCode
         public bool stopAtEntry;
         public bool ?justMyCode;
         public bool ?enableStepFiltering;
+        public bool ?exceptionAnnotations;
+        public List<string> exceptionAnnotationStores;
+        public uint ?exceptionAnnotationThreadLimit;
         public string internalConsoleOptions;
         public string __sessionId;
     }
@@ -67,6 +70,9 @@ namespace NetcoreDbgTest.VSCode
 
     public class AttachRequestArguments {
         public int processId;
+        public bool ?exceptionAnnotations;
+        public List<string> exceptionAnnotationStores;
+        public uint ?exceptionAnnotationThreadLimit;
     }
 
     public class ConfigurationDoneRequest : Request {

@@ -85,6 +85,8 @@ ALL_TEST_NAMES=(
     "VSCodeTestExtensionMethods"
     "VSCodeTestBreakpointWithoutStop"
     "VSCodeTestUnhandledException"
+    "VSCodeTestExceptionAnnotations"
+    "VSCodeTestExceptionAnnotationsAttach"
 )
 
 # Skipped tests:
