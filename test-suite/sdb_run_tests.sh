@@ -109,10 +109,12 @@ ALL_TEST_NAMES=(
     "VSCodeTestBreakpointWithoutStop"
     "VSCodeTestUnhandledException"
     "VSCodeTestExceptionAnnotations"
-    "VSCodeTestExceptionAnnotationsAttach"
+    "VSCodeTestExceptionAnnotationsStores"
+    "VSCodeTestExceptionAnnotationsOff"
 )
 
 # Skipped tests:
+# VSCodeTestExceptionAnnotationsAttach - attach test, starts the debuggee on the host side (like VSCodeTestAttach)
 # MITestBreakpointToModule - script don't support multiple DLLs copy to target
 
 SDB=${SDB:-sdb}

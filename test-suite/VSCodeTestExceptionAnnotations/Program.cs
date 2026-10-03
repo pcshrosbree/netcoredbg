@@ -42,12 +42,6 @@ namespace NetcoreDbgTest.Script
             launchRequest.arguments.console = "internalConsole";
             launchRequest.arguments.stopAtEntry = true;
             launchRequest.arguments.justMyCode = true;
-            // Decoy holder types, read under the same contract rules as System.Diagnostics.DebuggerAnnotationStore.
-            launchRequest.arguments.exceptionAnnotationStores = new List<string> {
-                "VSCodeTestExceptionAnnotations.CctorStore",
-                "VSCodeTestExceptionAnnotations.ObjectRingStore",
-                "VSCodeTestExceptionAnnotations.ShortRingStore"
-            };
             launchRequest.arguments.internalConsoleOptions = "openOnSessionStart";
             launchRequest.arguments.__sessionId = Guid.NewGuid().ToString();
             Assert.True(VSCodeDebugger.Request(launchRequest).Success, @"__FILE__:__LINE__"+"\n"+caller_trace);
@@ -152,9 +146,7 @@ namespace NetcoreDbgTest.Script
             throw new ResultNotSuccessException(@"__FILE__:__LINE__"+"\n"+caller_trace);
         }
 
-        // At the current exception stop, the exceptionInfo description must be exactly netcoredbg's own text for the
-        // exception, followed by exactly the expected annotation lines, in order.
-        public void TestAnnotations(string caller_trace, string excName, string excMessage, params string[] annotations)
+        public string GetDescription(string caller_trace, string excName)
         {
             ExceptionInfoRequest exceptionInfoRequest = new ExceptionInfoRequest();
             exceptionInfoRequest.arguments.threadId = threadId;
@@ -165,11 +157,23 @@ namespace NetcoreDbgTest.Script
                 JsonConvert.DeserializeObject<ExceptionInfoResponse>(ret.ResponseStr);
             Assert.Equal("always", exceptionInfoResponse.body.breakMode, @"__FILE__:__LINE__"+"\n"+caller_trace);
             Assert.Equal("CLR/" + excName, exceptionInfoResponse.body.exceptionId, @"__FILE__:__LINE__"+"\n"+caller_trace);
+            return exceptionInfoResponse.body.description;
+        }
 
+        public string ExpectedDescription(string excName, string excMessage, string[] annotations)
+        {
             string expected = "Exception thrown: '" + excName + "' in VSCodeTestExceptionAnnotations.dll: '" + excMessage + "'";
             foreach (string annotation in annotations)
                 expected += "\n " + annotation;
-            Assert.Equal(expected, exceptionInfoResponse.body.description, @"__FILE__:__LINE__"+"\n"+caller_trace);
+            return expected;
+        }
+
+        // At the current exception stop, the exceptionInfo description must be exactly netcoredbg's own text for the
+        // exception, followed by exactly the expected annotation lines, in order.
+        public void TestAnnotations(string caller_trace, string excName, string excMessage, params string[] annotations)
+        {
+            string description = GetDescription(caller_trace, excName);
+            Assert.Equal(ExpectedDescription(excName, excMessage, annotations), description, @"__FILE__:__LINE__"+"\n"+caller_trace);
         }
 
         public Context(ControlInfo controlInfo, NetcoreDbgTestCore.DebuggerClient debuggerClient)
@@ -246,75 +250,6 @@ namespace System.Diagnostics
 
 namespace VSCodeTestExceptionAnnotations
 {
-    // Decoy (cell K): the contract's fields, but a static field initializer gives the type a static constructor, so a
-    // debugger must not read it.
-    internal static class CctorStore
-    {
-        internal static readonly int Seed = Environment.TickCount;
-
-        [ThreadStatic] private static Entry[] t_annotations;
-        [ThreadStatic] private static int t_annotationCount;
-
-        internal sealed class Entry
-        {
-            internal readonly object Value;
-            internal readonly Exception Exception;
-            internal Entry(object value, Exception exception) { Value = value; Exception = exception; }
-        }
-
-        internal static void Record(object value, Exception exception)
-        {
-            Entry[] ring = t_annotations ?? (t_annotations = new Entry[8]);
-            uint count = unchecked((uint)t_annotationCount);
-            ring[count % 8] = new Entry(value, exception);
-            t_annotationCount = unchecked((int)(count + 1));
-        }
-    }
-
-    // Decoy (cell Q): t_annotations is declared object[] (not Entry[]) and holds valid instances of this type's Entry.
-    internal static class ObjectRingStore
-    {
-        [ThreadStatic] private static object[] t_annotations;
-        [ThreadStatic] private static int t_annotationCount;
-
-        internal sealed class Entry
-        {
-            internal readonly object Value;
-            internal readonly Exception Exception;
-            internal Entry(object value, Exception exception) { Value = value; Exception = exception; }
-        }
-
-        internal static void Record(object value, Exception exception)
-        {
-            object[] ring = t_annotations ?? (t_annotations = new object[8]);
-            uint count = unchecked((uint)t_annotationCount);
-            ring[count % 8] = new Entry(value, exception);
-            t_annotationCount = unchecked((int)(count + 1));
-        }
-    }
-
-    // Decoy (cell Q'): valid in every way except that the ring has 3 slots, not a power of two.
-    internal static class ShortRingStore
-    {
-        [ThreadStatic] private static Entry[] t_annotations;
-        [ThreadStatic] private static int t_annotationCount;
-
-        internal sealed class Entry
-        {
-            internal readonly object Value;
-            internal readonly Exception Exception;
-            internal Entry(object value, Exception exception) { Value = value; Exception = exception; }
-        }
-
-        internal static void Record(object value, Exception exception)
-        {
-            Entry[] ring = t_annotations ?? (t_annotations = new Entry[3]);
-            uint count = unchecked((uint)t_annotationCount);
-            ring[count % 3] = new Entry(value, exception);
-            t_annotationCount = unchecked((int)(count + 1));
-        }
-    }
-
     // A non-string annotation (cell P). A debugger shows its type name and must not call ToString().
     class CustomPayload
     {
@@ -343,6 +278,24 @@ namespace VSCodeTestExceptionAnnotations
                 throw exception;
             }
             catch (Exception) {}
+        }
+
+        // A second store with the same name in another module: this assembly loaded again, from bytes, into its own
+        // AssemblyLoadContext (a library copy per load context is a separate store). Loaded at cell L, after this
+        // module, so it comes second in store order.
+        static MethodInfo annotateInCopy;
+
+        static void LoadCopy()
+        {
+            var copy = new AssemblyLoadContext("annotation store copy", false)
+                .LoadFromStream(new MemoryStream(File.ReadAllBytes(typeof(Program).Assembly.Location)));
+            annotateInCopy = copy.GetType("System.Diagnostics.DebuggerAnnotationStore")
+                .GetMethod("Annotate", BindingFlags.NonPublic | BindingFlags.Static);
+        }
+
+        static void AnnotateInCopy(string annotation, Exception exception)
+        {
+            annotateInCopy.Invoke(null, new object[] { annotation, exception });
         }
 
         // Cell C: two threads each throw their own annotated exception; each stop shows its own thread's annotation.
@@ -385,28 +338,6 @@ namespace VSCodeTestExceptionAnnotations
             ThrowUnannotated(exception);
         }
 
-        // Cell L: a thread that never touched the store stops while another thread holds entries.
-        static void CellL()
-        {
-            var ready = new ManualResetEvent(false);
-            var release = new ManualResetEvent(false);
-            var first = new System.Threading.Thread(() => {
-                ThrowAnnotated(new InvalidOperationException("cell L thread 1"), "cell L thread 1 annotation");
-                ready.Set();
-                release.WaitOne();
-            });
-            first.Start();
-            ready.WaitOne();
-
-            var second = new System.Threading.Thread(() => {
-                ThrowUnannotated(new ArgumentException("cell L thread 2"));
-            });
-            second.Start();
-            second.Join();
-            release.Set();
-            first.Join();
-        }
-
         // Cell M: the count wraps. Seeded to 0xFFFFFFFE, the target goes to slot 6, two more to slots 7 and 0, and the
         // count ends at 1.
         static void CellM()
@@ -424,8 +355,8 @@ namespace VSCodeTestExceptionAnnotations
             thread.Join();
         }
 
-        // Cell N: the recording thread hands the exception over and blocks in a native wait; another thread rethrows it
-        // with ExceptionDispatchInfo. The annotation is found on the recording thread and labelled with it.
+        // Cell N: the recording thread hands the exception over and blocks in a wait; another thread rethrows it with
+        // ExceptionDispatchInfo. The annotation is found on the recording thread and labelled with it.
         static void CellN()
         {
             ExceptionDispatchInfo captured = null;
@@ -476,22 +407,45 @@ namespace VSCodeTestExceptionAnnotations
             other.Join();
         }
 
-        // Cell T: two stores with the same name in two modules. The second is this assembly loaded again, from bytes,
-        // into its own AssemblyLoadContext (a library copy per load context is a separate store). This module's store
-        // matches on the stopped thread, the copy's (loaded later) only on another thread: both are shown, this
-        // module's first.
+        // Cell L: a thread that never touched this module's store stops (its read of that store finds no storage,
+        // which must mean "empty"); its exception is annotated in the copy's store, which must still be shown.
+        // Every other thread alive at that stop has storage in both stores, so the only "no storage" read is the one
+        // on the stopping thread.
+        static void CellL()
+        {
+            LoadCopy();
+            AnnotateInCopy("cell L main thread filler", new InvalidOperationException("filler"));
+            var ready = new ManualResetEvent(false);
+            var release = new ManualResetEvent(false);
+            var first = new System.Threading.Thread(() => {
+                AnnotateInCopy("cell L thread 1 filler", new InvalidOperationException("filler"));
+                ThrowAnnotated(new InvalidOperationException("cell L thread 1"), "cell L thread 1 annotation");
+                ready.Set();
+                release.WaitOne();
+            });
+            first.Start();
+            ready.WaitOne();
+
+            var second = new System.Threading.Thread(() => {
+                var exception = new InvalidOperationException("cell L thread 2");
+                AnnotateInCopy("cell L copy store annotation", exception);
+                ThrowUnannotated(exception);
+            });
+            second.Start();
+            second.Join();
+            release.Set();
+            first.Join();
+        }
+
+        // Cell T: two stores with the same name in two modules. This module's store matches on the stopped thread, the
+        // copy's (loaded later) only on another thread: both are shown, this module's first.
         static void CellT()
         {
-            var copy = new AssemblyLoadContext("cell T copy", false)
-                .LoadFromStream(new MemoryStream(File.ReadAllBytes(typeof(Program).Assembly.Location)));
-            MethodInfo annotateInCopy = copy.GetType("System.Diagnostics.DebuggerAnnotationStore")
-                .GetMethod("Annotate", BindingFlags.NonPublic | BindingFlags.Static);
-
             var exception = new InvalidOperationException("cell T");
             var ready = new ManualResetEvent(false);
             var release = new ManualResetEvent(false);
             var other = new System.Threading.Thread(() => {
-                annotateInCopy.Invoke(null, new object[] { "cell T copy store annotation", exception });
+                AnnotateInCopy("cell T copy store annotation", exception);
                 ready.Set();
                 release.WaitOne();
             });
@@ -562,37 +516,13 @@ namespace VSCodeTestExceptionAnnotations
             CellE(7, "cell E7");
             CellE(8, "cell E8");
 
-            Label.Checkpoint("cell_E", "cell_K", (Object context) => {
+            Label.Checkpoint("cell_E", "cell_M", (Object context) => {
                 Context Context = (Context)context;
                 Context.WasExceptionStop(@"__FILE__:__LINE__");
                 Context.TestAnnotations(@"__FILE__:__LINE__", "System.InvalidOperationException", "cell E7", "Annotation: cell E7 annotation");
                 Context.Continue(@"__FILE__:__LINE__");
                 Context.WasExceptionStop(@"__FILE__:__LINE__");
                 Context.TestAnnotations(@"__FILE__:__LINE__", "System.InvalidOperationException", "cell E8");
-                Context.Continue(@"__FILE__:__LINE__");
-            });
-
-            // Cell K: the only entry for this exception is in a store with a static constructor.
-            var exceptionK = new InvalidOperationException("cell K");
-            CctorStore.Record("cell K annotation", exceptionK);
-            ThrowUnannotated(exceptionK);
-
-            Label.Checkpoint("cell_K", "cell_L", (Object context) => {
-                Context Context = (Context)context;
-                Context.WasExceptionStop(@"__FILE__:__LINE__");
-                Context.TestAnnotations(@"__FILE__:__LINE__", "System.InvalidOperationException", "cell K");
-                Context.Continue(@"__FILE__:__LINE__");
-            });
-
-            CellL();
-
-            Label.Checkpoint("cell_L", "cell_M", (Object context) => {
-                Context Context = (Context)context;
-                Context.WasExceptionStop(@"__FILE__:__LINE__");
-                Context.TestAnnotations(@"__FILE__:__LINE__", "System.InvalidOperationException", "cell L thread 1", "Annotation: cell L thread 1 annotation");
-                Context.Continue(@"__FILE__:__LINE__");
-                Context.WasExceptionStop(@"__FILE__:__LINE__");
-                Context.TestAnnotations(@"__FILE__:__LINE__", "System.ArgumentException", "cell L thread 2");
                 Context.Continue(@"__FILE__:__LINE__");
             });
 
@@ -636,30 +566,41 @@ namespace VSCodeTestExceptionAnnotations
             DebuggerAnnotationStore.Record(new CustomPayload(), exceptionP);
             ThrowUnannotated(exceptionP);
 
-            Label.Checkpoint("cell_P", "cell_Q", (Object context) => {
+            Label.Checkpoint("cell_P", "strings", (Object context) => {
                 Context Context = (Context)context;
                 Context.WasExceptionStop(@"__FILE__:__LINE__");
                 Context.TestAnnotations(@"__FILE__:__LINE__", "System.InvalidOperationException", "cell P", "Annotation: {VSCodeTestExceptionAnnotations.CustomPayload}");
                 Context.Continue(@"__FILE__:__LINE__");
             });
 
-            // Cell Q: the only entry for this exception is in a store whose ring is declared object[].
-            var exceptionQ = new InvalidOperationException("cell Q");
-            ObjectRingStore.Record("cell Q annotation", exceptionQ);
-            ThrowUnannotated(exceptionQ);
+            // Strings a debugger must render without failing: an unpaired surrogate (shown as U+FFFD), an embedded NUL
+            // (kept), and a long string whose truncation point falls inside a surrogate pair (cut before the pair).
+            ThrowAnnotated(new InvalidOperationException("cell S1"), "\uDC00");
+            ThrowAnnotated(new InvalidOperationException("cell S2"), "before\0after");
+            ThrowAnnotated(new InvalidOperationException("cell S3"), new string('x', 4095) + "\uD83D\uDE00" + "tail");
 
-            // Cell Q': the only entry for this exception is in a store whose ring has 3 slots.
-            var exceptionQ2 = new InvalidOperationException("cell Q2");
-            ShortRingStore.Record("cell Q2 annotation", exceptionQ2);
-            ThrowUnannotated(exceptionQ2);
-
-            Label.Checkpoint("cell_Q", "cell_T", (Object context) => {
+            Label.Checkpoint("strings", "cell_L", (Object context) => {
                 Context Context = (Context)context;
                 Context.WasExceptionStop(@"__FILE__:__LINE__");
-                Context.TestAnnotations(@"__FILE__:__LINE__", "System.InvalidOperationException", "cell Q");
+                Context.TestAnnotations(@"__FILE__:__LINE__", "System.InvalidOperationException", "cell S1", "Annotation: \uFFFD");
                 Context.Continue(@"__FILE__:__LINE__");
                 Context.WasExceptionStop(@"__FILE__:__LINE__");
-                Context.TestAnnotations(@"__FILE__:__LINE__", "System.InvalidOperationException", "cell Q2");
+                Context.TestAnnotations(@"__FILE__:__LINE__", "System.InvalidOperationException", "cell S2", "Annotation: before\0after");
+                Context.Continue(@"__FILE__:__LINE__");
+                Context.WasExceptionStop(@"__FILE__:__LINE__");
+                Context.TestAnnotations(@"__FILE__:__LINE__", "System.InvalidOperationException", "cell S3", "Annotation: " + new string('x', 4095) + "...");
+                Context.Continue(@"__FILE__:__LINE__");
+            });
+
+            CellL();
+
+            Label.Checkpoint("cell_L", "cell_T", (Object context) => {
+                Context Context = (Context)context;
+                Context.WasExceptionStop(@"__FILE__:__LINE__");
+                Context.TestAnnotations(@"__FILE__:__LINE__", "System.InvalidOperationException", "cell L thread 1", "Annotation: cell L thread 1 annotation");
+                Context.Continue(@"__FILE__:__LINE__");
+                Context.WasExceptionStop(@"__FILE__:__LINE__");
+                Context.TestAnnotations(@"__FILE__:__LINE__", "System.InvalidOperationException", "cell L thread 2", "Annotation: cell L copy store annotation");
                 Context.Continue(@"__FILE__:__LINE__");
             });
 

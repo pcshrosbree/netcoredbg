@@ -86,6 +86,8 @@ ALL_TEST_NAMES=(
     "VSCodeTestBreakpointWithoutStop"
     "VSCodeTestUnhandledException"
     "VSCodeTestExceptionAnnotations"
+    "VSCodeTestExceptionAnnotationsStores"
+    "VSCodeTestExceptionAnnotationsOff"
     "VSCodeTestExceptionAnnotationsAttach"
 )
 
