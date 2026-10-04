@@ -341,7 +341,7 @@ namespace VSCodeTestExceptionAnnotationsStores
 
     // A conforming store that no code uses, so the runtime never loads the class: nothing to read on any thread. It
     // exercises the reader's CORDBG_E_CLASS_NOT_LOADED shortcut (skip the other threads for this store), which changes
-    // only cost, never output: a performance path, unpinned by design (the reader's log shows it).
+    // only cost, never output: an optimisation, unpinned by design (the reader's log shows it).
     internal static class UnusedStore
     {
         [ThreadStatic] private static Entry[] t_annotations;
