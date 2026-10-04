@@ -578,6 +578,14 @@ namespace VSCodeTestExceptionAnnotations
             ThrowAnnotated(new InvalidOperationException("cell S1"), "\uDC00");
             ThrowAnnotated(new InvalidOperationException("cell S2"), "before\0after");
             ThrowAnnotated(new InvalidOperationException("cell S3"), new string('x', 4095) + "\uD83D\uDE00" + "tail");
+            // Surrogate endpoints: a lone DFFF (U+FFFD); pairs at both ends of each range, which must arrive as the
+            // same code points (U+103FF, U+10FFFF, U+10FC00, U+10000); a pair ending in DFFF straddling the limit.
+            ThrowAnnotated(new InvalidOperationException("cell S4"), "\uDFFF");
+            ThrowAnnotated(new InvalidOperationException("cell S5"), "\uD800\uDFFF");
+            ThrowAnnotated(new InvalidOperationException("cell S6"), "\uDBFF\uDFFF");
+            ThrowAnnotated(new InvalidOperationException("cell S7"), "\uDBFF\uDC00");
+            ThrowAnnotated(new InvalidOperationException("cell S8"), "\uD800\uDC00");
+            ThrowAnnotated(new InvalidOperationException("cell S9"), new string('x', 4095) + "\uD800\uDFFF" + "tail");
 
             Label.Checkpoint("strings", "cell_L", (Object context) => {
                 Context Context = (Context)context;
@@ -589,6 +597,24 @@ namespace VSCodeTestExceptionAnnotations
                 Context.Continue(@"__FILE__:__LINE__");
                 Context.WasExceptionStop(@"__FILE__:__LINE__");
                 Context.TestAnnotations(@"__FILE__:__LINE__", "System.InvalidOperationException", "cell S3", "Annotation: " + new string('x', 4095) + "...");
+                Context.Continue(@"__FILE__:__LINE__");
+                Context.WasExceptionStop(@"__FILE__:__LINE__");
+                Context.TestAnnotations(@"__FILE__:__LINE__", "System.InvalidOperationException", "cell S4", "Annotation: \uFFFD");
+                Context.Continue(@"__FILE__:__LINE__");
+                Context.WasExceptionStop(@"__FILE__:__LINE__");
+                Context.TestAnnotations(@"__FILE__:__LINE__", "System.InvalidOperationException", "cell S5", "Annotation: \uD800\uDFFF");
+                Context.Continue(@"__FILE__:__LINE__");
+                Context.WasExceptionStop(@"__FILE__:__LINE__");
+                Context.TestAnnotations(@"__FILE__:__LINE__", "System.InvalidOperationException", "cell S6", "Annotation: \uDBFF\uDFFF");
+                Context.Continue(@"__FILE__:__LINE__");
+                Context.WasExceptionStop(@"__FILE__:__LINE__");
+                Context.TestAnnotations(@"__FILE__:__LINE__", "System.InvalidOperationException", "cell S7", "Annotation: \uDBFF\uDC00");
+                Context.Continue(@"__FILE__:__LINE__");
+                Context.WasExceptionStop(@"__FILE__:__LINE__");
+                Context.TestAnnotations(@"__FILE__:__LINE__", "System.InvalidOperationException", "cell S8", "Annotation: \uD800\uDC00");
+                Context.Continue(@"__FILE__:__LINE__");
+                Context.WasExceptionStop(@"__FILE__:__LINE__");
+                Context.TestAnnotations(@"__FILE__:__LINE__", "System.InvalidOperationException", "cell S9", "Annotation: " + new string('x', 4095) + "...");
                 Context.Continue(@"__FILE__:__LINE__");
             });
 

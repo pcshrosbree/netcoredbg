@@ -51,10 +51,12 @@ namespace NetcoreDbgTest.Script
                 "VSCodeTestExceptionAnnotationsStores.ObjectRingStore",
                 "VSCodeTestExceptionAnnotationsStores.ShortRingStore",
                 "VSCodeTestExceptionAnnotationsStores.SharedStaticStore",
+                "VSCodeTestExceptionAnnotationsStores.SharedRingStore",
+                "VSCodeTestExceptionAnnotationsStores.SharedCountStore",
                 "VSCodeTestExceptionAnnotationsStores.UnsealedEntryStore",
                 "VSCodeTestExceptionAnnotationsStores.UnusedStore"
             };
-            launchRequest.arguments.exceptionAnnotationThreadLimit = 1;
+            launchRequest.arguments.exceptionAnnotationThreadLimit = 3;
             launchRequest.arguments.internalConsoleOptions = "openOnSessionStart";
             launchRequest.arguments.__sessionId = Guid.NewGuid().ToString();
             Assert.True(VSCodeDebugger.Request(launchRequest).Success, @"__FILE__:__LINE__"+"\n"+caller_trace);
@@ -189,15 +191,53 @@ namespace NetcoreDbgTest.Script
             Assert.Equal(ExpectedDescription(excName, excMessage, annotations), description, @"__FILE__:__LINE__"+"\n"+caller_trace);
         }
 
-        // The description must be one of two exact texts.
-        public void TestAnnotationsEither(string caller_trace, string excName, string excMessage, string annotation1, string annotation2)
+        // Cell LIM, against the documented limit semantics: per store and per stop the reader reads at most `limit` other
+        // threads that have a managed frame, in enumeration order, and reuses the same threads for every store. So,
+        // whatever other managed threads the process has: the default store's lines come first, then the extra-named
+        // store's; each store has between 1 and `limit` lines (at least one recorder is among the first `limit` threads
+        // with a frame unless `limit` unrelated managed threads precede all of them); every line names the recorder thread
+        // that wrote it; and both stores name the same set of threads.
+        public void TestThreadLimit(string caller_trace, string excName, string excMessage, int limit, int recorders)
         {
             string description = GetDescription(caller_trace, excName);
-            string expected1 = ExpectedDescription(excName, excMessage, new string[] { annotation1 });
-            string expected2 = ExpectedDescription(excName, excMessage, new string[] { annotation2 });
-            if (description == expected1 || description == expected2)
-                return;
-            Assert.Equal(expected1, description, @"__FILE__:__LINE__"+"\n"+caller_trace);
+            string head = ExpectedDescription(excName, excMessage, new string[0]);
+            Assert.True(description.StartsWith(head), @"__FILE__:__LINE__"+"\n"+caller_trace);
+
+            ThreadsResponse threadsResponse = JsonConvert.DeserializeObject<ThreadsResponse>(VSCodeDebugger.Request(new ThreadsRequest()).ResponseStr);
+            Dictionary<int, string> names = new Dictionary<int, string>();
+            foreach (NetcoreDbgTest.VSCode.Thread thread in threadsResponse.body.threads)
+                names[thread.id] = thread.name;
+
+            List<string> defaultThreads = new List<string>();
+            List<string> extraThreads = new List<string>();
+            string[] lines = description.Substring(head.Length).Split('\n');
+            Assert.Equal("", lines[0], @"__FILE__:__LINE__"+"\n"+caller_trace);
+            for (int i = 1; i < lines.Length; i++)
+            {
+                const string prefix = " Annotation (recorded on thread ";
+                Assert.True(lines[i].StartsWith(prefix), @"__FILE__:__LINE__"+"\n"+caller_trace);
+                int close = lines[i].IndexOf("): ");
+                int tid = Convert.ToInt32(lines[i].Substring(prefix.Length, close - prefix.Length));
+                string text = lines[i].Substring(close + 3);
+                Assert.True(names.ContainsKey(tid), @"__FILE__:__LINE__"+"\n"+caller_trace);
+                string recorder = names[tid];
+                Assert.True(recorder.StartsWith("cell LIM thread "), @"__FILE__:__LINE__"+"\n"+caller_trace);
+                string index = recorder.Substring("cell LIM thread ".Length);
+                if (text == "cell LIM default " + index)
+                {
+                    Assert.True(extraThreads.Count == 0, @"__FILE__:__LINE__"+"\n"+caller_trace); // store order
+                    defaultThreads.Add(index);
+                }
+                else
+                {
+                    Assert.Equal("cell LIM extra " + index, text, @"__FILE__:__LINE__"+"\n"+caller_trace);
+                    extraThreads.Add(index);
+                }
+            }
+            Assert.True(defaultThreads.Count >= 1 && defaultThreads.Count <= limit, @"__FILE__:__LINE__"+"\n"+caller_trace);
+            Assert.True(extraThreads.Count >= 1 && extraThreads.Count <= limit, @"__FILE__:__LINE__"+"\n"+caller_trace);
+            Assert.Equal(string.Join(",", defaultThreads), string.Join(",", extraThreads), @"__FILE__:__LINE__"+"\n"+caller_trace);
+            Assert.True(recorders > limit, @"__FILE__:__LINE__"+"\n"+caller_trace);
         }
 
         public Context(ControlInfo controlInfo, NetcoreDbgTestCore.DebuggerClient debuggerClient)
@@ -296,7 +336,9 @@ namespace VSCodeTestExceptionAnnotationsStores
         }
     }
 
-    // A conforming store that no code uses, so the runtime never loads the class: nothing to read on any thread.
+    // A conforming store that no code uses, so the runtime never loads the class: nothing to read on any thread. It
+    // exercises the reader's CORDBG_E_CLASS_NOT_LOADED shortcut (skip the other threads for this store), which changes
+    // only cost, never output: a performance path, unpinned by design (the reader's log shows it).
     internal static class UnusedStore
     {
         [ThreadStatic] private static Entry[] t_annotations;
@@ -402,6 +444,56 @@ namespace VSCodeTestExceptionAnnotationsStores
         }
     }
 
+    // Decoy (cell TS1): only the ring is an ordinary static (one ring for the whole process); the count is thread-static.
+    internal static class SharedRingStore
+    {
+        private static Entry[] t_annotations;
+        [ThreadStatic] private static int t_annotationCount;
+
+        internal sealed class Entry
+        {
+            internal readonly object Value;
+            internal readonly Exception Exception;
+            internal Entry(object value, Exception exception) { Value = value; Exception = exception; }
+        }
+
+        internal static void Record(object value, Exception exception)
+        {
+            Entry[] ring = t_annotations ?? (t_annotations = new Entry[8]);
+            uint count = unchecked((uint)t_annotationCount);
+            ring[count % 8] = new Entry(value, exception);
+            t_annotationCount = unchecked((int)(count + 1));
+        }
+
+        // Gives the calling thread storage for the count, so a reader that accepted this store could read it here.
+        internal static void TouchCount()
+        {
+            t_annotationCount = 0;
+        }
+    }
+
+    // Decoy (cell TS2): only the count is an ordinary static; the ring is thread-static.
+    internal static class SharedCountStore
+    {
+        [ThreadStatic] private static Entry[] t_annotations;
+        private static int t_annotationCount;
+
+        internal sealed class Entry
+        {
+            internal readonly object Value;
+            internal readonly Exception Exception;
+            internal Entry(object value, Exception exception) { Value = value; Exception = exception; }
+        }
+
+        internal static void Record(object value, Exception exception)
+        {
+            Entry[] ring = t_annotations ?? (t_annotations = new Entry[8]);
+            uint count = unchecked((uint)t_annotationCount);
+            ring[count % 8] = new Entry(value, exception);
+            t_annotationCount = unchecked((int)(count + 1));
+        }
+    }
+
     // Decoy (cell U): valid except that Entry is not sealed.
     internal static class UnsealedEntryStore
     {
@@ -455,33 +547,64 @@ namespace VSCodeTestExceptionAnnotationsStores
             ThrowUnannotated(exception);
         }
 
-        // Cell LIM: two other threads hold an annotation of the exception thrown here; with a thread limit of 1, the
-        // reader reads one of them only.
+        // Cell TS1: the shared ring is written on another thread; this thread has storage for the (thread-static) count.
+        static void CellSharedRing()
+        {
+            var exception = new InvalidOperationException("cell TS1");
+            var writer = new System.Threading.Thread(() => SharedRingStore.Record("cell TS1 annotation", exception));
+            writer.Start();
+            writer.Join();
+            SharedRingStore.TouchCount();
+            ThrowUnannotated(exception);
+        }
+
+        // Cell TS2: another thread writes its own (thread-static) ring and stays alive while the exception is thrown here.
+        static void CellSharedCount()
+        {
+            var exception = new InvalidOperationException("cell TS2");
+            var ready = new ManualResetEvent(false);
+            var release = new ManualResetEvent(false);
+            var writer = new System.Threading.Thread(() => {
+                SharedCountStore.Record("cell TS2 annotation", exception);
+                ready.Set();
+                release.WaitOne();
+            });
+            writer.Start();
+            ready.WaitOne();
+            ThrowUnannotated(exception);
+            release.Set();
+            writer.Join();
+        }
+
+        const int LimitRecorders = 8;
+
+        // Cell LIM: eight other threads each annotate the exception thrown here in two stores; with a thread limit of 3,
+        // at most three of them are read per store, and the same ones for both stores.
         static void CellLimit()
         {
             var exception = new InvalidOperationException("cell LIM");
-            var ready = new CountdownEvent(2);
+            var ready = new CountdownEvent(LimitRecorders);
             var release = new ManualResetEvent(false);
-            var first = new System.Threading.Thread(() => {
-                DebuggerAnnotationStore.Annotate("cell LIM thread 1 annotation", exception);
-                ready.Signal();
-                release.WaitOne();
-            });
-            first.Name = "cell LIM thread 1";
-            var second = new System.Threading.Thread(() => {
-                DebuggerAnnotationStore.Annotate("cell LIM thread 2 annotation", exception);
-                ready.Signal();
-                release.WaitOne();
-            });
-            second.Name = "cell LIM thread 2";
-            first.Start();
-            second.Start();
+            var threads = new List<System.Threading.Thread>();
+            for (int i = 1; i <= LimitRecorders; i++)
+            {
+                int index = i;
+                var thread = new System.Threading.Thread(() => {
+                    DebuggerAnnotationStore.Annotate("cell LIM default " + index, exception);
+                    ExtraNamedStore.Record("cell LIM extra " + index, exception);
+                    ready.Signal();
+                    release.WaitOne();
+                });
+                thread.Name = "cell LIM thread " + index;
+                threads.Add(thread);
+                thread.Start();
+            }
             ready.Wait();
 
             ThrowUnannotated(exception);
             release.Set();
-            first.Join();
-            second.Join();
+            foreach (var thread in threads)
+                thread.Join();
         }
 
         static void Main(string[] args)
@@ -545,10 +668,19 @@ namespace VSCodeTestExceptionAnnotationsStores
 
             CellTS();
 
+            CellSharedRing();
+            CellSharedCount();
+
             Label.Checkpoint("cell_TS", "cell_U", (Object context) => {
                 Context Context = (Context)context;
                 Context.WasExceptionStop(@"__FILE__:__LINE__");
                 Context.TestAnnotations(@"__FILE__:__LINE__", "System.InvalidOperationException", "cell TS");
+                Context.Continue(@"__FILE__:__LINE__");
+                Context.WasExceptionStop(@"__FILE__:__LINE__");
+                Context.TestAnnotations(@"__FILE__:__LINE__", "System.InvalidOperationException", "cell TS1");
+                Context.Continue(@"__FILE__:__LINE__");
+                Context.WasExceptionStop(@"__FILE__:__LINE__");
+                Context.TestAnnotations(@"__FILE__:__LINE__", "System.InvalidOperationException", "cell TS2");
                 Context.Continue(@"__FILE__:__LINE__");
             });
 
@@ -569,11 +701,7 @@ namespace VSCodeTestExceptionAnnotationsStores
             Label.Checkpoint("cell_LIM", "finish", (Object context) => {
                 Context Context = (Context)context;
                 Context.WasExceptionStop(@"__FILE__:__LINE__");
-                int first = Context.ThreadIdByName(@"__FILE__:__LINE__", "cell LIM thread 1");
-                int second = Context.ThreadIdByName(@"__FILE__:__LINE__", "cell LIM thread 2");
-                Context.TestAnnotationsEither(@"__FILE__:__LINE__", "System.InvalidOperationException", "cell LIM",
-                                              "Annotation (recorded on thread " + first + "): cell LIM thread 1 annotation",
-                                              "Annotation (recorded on thread " + second + "): cell LIM thread 2 annotation");
+                Context.TestThreadLimit(@"__FILE__:__LINE__", "System.InvalidOperationException", "cell LIM", 3, 8);
                 Context.Continue(@"__FILE__:__LINE__");
             });
 
