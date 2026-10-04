@@ -5,6 +5,7 @@ using System.Diagnostics;
 using System.Reflection;
 using System.Runtime.CompilerServices;
 using System.Runtime.ExceptionServices;
+using System.Runtime.InteropServices;
 using System.Runtime.Loader;
 using System.Threading;
 
@@ -56,7 +57,7 @@ namespace NetcoreDbgTest.Script
                 "VSCodeTestExceptionAnnotationsStores.UnsealedEntryStore",
                 "VSCodeTestExceptionAnnotationsStores.UnusedStore"
             };
-            launchRequest.arguments.exceptionAnnotationThreadLimit = 3;
+            launchRequest.arguments.exceptionAnnotationThreadLimit = 31;
             launchRequest.arguments.internalConsoleOptions = "openOnSessionStart";
             launchRequest.arguments.__sessionId = Guid.NewGuid().ToString();
             Assert.True(VSCodeDebugger.Request(launchRequest).Success, @"__FILE__:__LINE__"+"\n"+caller_trace);
@@ -191,12 +192,14 @@ namespace NetcoreDbgTest.Script
             Assert.Equal(ExpectedDescription(excName, excMessage, annotations), description, @"__FILE__:__LINE__"+"\n"+caller_trace);
         }
 
-        // Cell LIM, against the documented limit semantics: per store and per stop the reader reads at most `limit` other
-        // threads that have a managed frame, in enumeration order, and reuses the same threads for every store. So,
-        // whatever other managed threads the process has: the default store's lines come first, then the extra-named
-        // store's; each store has between 1 and `limit` lines (at least one recorder is among the first `limit` threads
-        // with a frame unless `limit` unrelated managed threads precede all of them); every line names the recorder thread
-        // that wrote it; and both stores name the same set of threads.
+        // Cell LIM, against the documented limit semantics: per store and per stop the reader reads the ring of exactly
+        // `limit` other threads that have a managed frame (when more exist), in enumeration order, skipping threads that
+        // have none, and reuses the same threads for every store. The recorders are the only other threads with a managed
+        // frame here (the runtime's own threads, such as the finalizer, have none), so each store shows exactly `limit`
+        // lines whatever the enumeration order: the default store's first, then the extra-named store's, every line
+        // naming the recorder that wrote it, and both stores naming the same threads. One recorder more than the limit
+        // is left unread, so a reader that ignored the limit shows one line too many; a reader that also counted the
+        // frameless threads would lose a recorder unless every frameless thread happened to be enumerated last.
         public void TestThreadLimit(string caller_trace, string excName, string excMessage, int limit, int recorders)
         {
             string description = GetDescription(caller_trace, excName);
@@ -234,8 +237,8 @@ namespace NetcoreDbgTest.Script
                     extraThreads.Add(index);
                 }
             }
-            Assert.True(defaultThreads.Count >= 1 && defaultThreads.Count <= limit, @"__FILE__:__LINE__"+"\n"+caller_trace);
-            Assert.True(extraThreads.Count >= 1 && extraThreads.Count <= limit, @"__FILE__:__LINE__"+"\n"+caller_trace);
+            Assert.Equal(limit, defaultThreads.Count, @"__FILE__:__LINE__"+"\n"+caller_trace);
+            Assert.Equal(limit, extraThreads.Count, @"__FILE__:__LINE__"+"\n"+caller_trace);
             Assert.Equal(string.Join(",", defaultThreads), string.Join(",", extraThreads), @"__FILE__:__LINE__"+"\n"+caller_trace);
             Assert.True(recorders > limit, @"__FILE__:__LINE__"+"\n"+caller_trace);
         }
@@ -576,10 +579,10 @@ namespace VSCodeTestExceptionAnnotationsStores
             writer.Join();
         }
 
-        const int LimitRecorders = 8;
+        const int LimitRecorders = 32;
 
-        // Cell LIM: eight other threads each annotate the exception thrown here in two stores; with a thread limit of 3,
-        // at most three of them are read per store, and the same ones for both stores.
+        // Cell LIM: 32 other threads each annotate the exception thrown here in two stores; with a thread limit of 31,
+        // exactly 31 of them are read per store, and the same ones for both stores.
         static void CellLimit()
         {
             var exception = new InvalidOperationException("cell LIM");
@@ -701,7 +704,7 @@ namespace VSCodeTestExceptionAnnotationsStores
             Label.Checkpoint("cell_LIM", "finish", (Object context) => {
                 Context Context = (Context)context;
                 Context.WasExceptionStop(@"__FILE__:__LINE__");
-                Context.TestThreadLimit(@"__FILE__:__LINE__", "System.InvalidOperationException", "cell LIM", 3, 8);
+                Context.TestThreadLimit(@"__FILE__:__LINE__", "System.InvalidOperationException", "cell LIM", 31, 32);
                 Context.Continue(@"__FILE__:__LINE__");
             });
 

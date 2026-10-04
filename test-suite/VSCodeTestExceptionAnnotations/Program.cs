@@ -5,6 +5,7 @@ using System.Diagnostics;
 using System.Reflection;
 using System.Runtime.CompilerServices;
 using System.Runtime.ExceptionServices;
+using System.Runtime.InteropServices;
 using System.Runtime.Loader;
 using System.Threading;
 
@@ -458,6 +459,64 @@ namespace VSCodeTestExceptionAnnotations
             other.Join();
         }
 
+        // A native wait entered from a DynamicMethod: the thread's leaf managed frame is the dynamic method, which the
+        // debugger does not report as the thread's active IL frame, so a reader finds the thread's managed frame only by
+        // walking its stack. (A wait reached through an ordinary P/Invoke still reports an IL active frame on Linux.)
+        static Action NativeWaitFromDynamicMethod()
+        {
+            bool windows = RuntimeInformation.IsOSPlatform(OSPlatform.Windows);
+            string library = windows ? "kernel32.dll" : RuntimeInformation.IsOSPlatform(OSPlatform.OSX) ? "libSystem.dylib" : "libc.so.6";
+            IntPtr wait = NativeLibrary.GetExport(NativeLibrary.Load(library), windows ? "Sleep" : "sleep");
+            Type returnType = windows ? typeof(void) : typeof(uint);
+            uint duration = windows ? 600000u : 600u; // milliseconds on Windows, seconds elsewhere
+
+            var method = new System.Reflection.Emit.DynamicMethod("AnnotationsNativeWait", typeof(void), new[] { typeof(IntPtr), typeof(uint) }, typeof(Program).Module);
+            System.Reflection.Emit.ILGenerator il = method.GetILGenerator();
+            il.Emit(System.Reflection.Emit.OpCodes.Ldarg_1);
+            il.Emit(System.Reflection.Emit.OpCodes.Ldarg_0);
+            il.EmitCalli(System.Reflection.Emit.OpCodes.Calli, windows ? CallingConvention.StdCall : CallingConvention.Cdecl, returnType, new[] { typeof(uint) });
+            if (returnType != typeof(void))
+                il.Emit(System.Reflection.Emit.OpCodes.Pop);
+            il.Emit(System.Reflection.Emit.OpCodes.Ret);
+            var call = (Action<IntPtr, uint>)method.CreateDelegate(typeof(Action<IntPtr, uint>));
+            return () => call(wait, duration);
+        }
+
+        // Cell N2: as N, but the recording thread then blocks in native code called from a DynamicMethod, so the only way
+        // to read its ring is through a managed frame found by walking its stack. It is a background thread, left blocked
+        // until the process exits, so this cell comes last.
+        static void CellN2()
+        {
+            Action block = NativeWaitFromDynamicMethod();
+            ExceptionDispatchInfo captured = null;
+            var handover = new ManualResetEvent(false);
+            var recorder = new System.Threading.Thread(() => {
+                var exception = new InvalidOperationException("cell N2");
+                try
+                {
+                    DebuggerAnnotationStore.Annotate("cell N2 annotation", exception);
+                    throw exception;
+                }
+                catch (Exception e)
+                {
+                    captured = ExceptionDispatchInfo.Capture(e);
+                }
+                handover.Set();
+                block();
+            });
+            recorder.Name = "cell N2 recording thread";
+            recorder.IsBackground = true;
+            recorder.Start();
+            handover.WaitOne();
+            System.Threading.Thread.Sleep(1000); // let the recorder enter the native wait
+
+            try
+            {
+                captured.Throw();
+            }
+            catch (Exception) {}
+        }
+
         static void Main(string[] args)
         {
             Label.Checkpoint("init", "cell_A", (Object context) => {
@@ -632,13 +691,27 @@ namespace VSCodeTestExceptionAnnotations
 
             CellT();
 
-            Label.Checkpoint("cell_T", "finish", (Object context) => {
+            Label.Checkpoint("cell_T", "cell_N2", (Object context) => {
                 Context Context = (Context)context;
                 Context.WasExceptionStop(@"__FILE__:__LINE__");
                 int other = Context.ThreadIdByName(@"__FILE__:__LINE__", "cell T other thread");
                 Context.TestAnnotations(@"__FILE__:__LINE__", "System.InvalidOperationException", "cell T",
                                         "Annotation: cell T test assembly store annotation",
                                         "Annotation (recorded on thread " + other + "): cell T copy store annotation");
+                Context.Continue(@"__FILE__:__LINE__");
+            });
+
+            CellN2();
+
+            Label.Checkpoint("cell_N2", "finish", (Object context) => {
+                Context Context = (Context)context;
+                Context.WasExceptionStop(@"__FILE__:__LINE__");
+                Context.TestAnnotations(@"__FILE__:__LINE__", "System.InvalidOperationException", "cell N2", "Annotation: cell N2 annotation");
+                Context.Continue(@"__FILE__:__LINE__");
+                Context.WasExceptionStop(@"__FILE__:__LINE__");
+                int recorder = Context.ThreadIdByName(@"__FILE__:__LINE__", "cell N2 recording thread");
+                Context.TestAnnotations(@"__FILE__:__LINE__", "System.InvalidOperationException", "cell N2",
+                                        "Annotation (recorded on thread " + recorder + "): cell N2 annotation");
                 Context.Continue(@"__FILE__:__LINE__");
             });
 
