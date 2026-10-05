@@ -220,6 +220,13 @@ namespace NetcoreDbgTest.Script
             throw new ResultNotSuccessException(@"__FILE__:__LINE__"+"\n"+caller_trace);
         }
 
+        public void AssignVar(string caller_trace, string varName, string val)
+        {
+            Assert.Equal(MIResultClass.Done,
+                         MIDebugger.Request(String.Format("-var-assign {0} \"{1}\"", varName, val)).Class,
+                         @"__FILE__:__LINE__"+"\n"+caller_trace);
+        }
+
         public void ErrorAtAssignVar(string caller_trace, string varName, string val)
         {
             Assert.Equal(MIResultClass.Error,
@@ -267,6 +274,12 @@ namespace MITestStaticFields
 
     // Not used by program code at all.
     public class NoCctorUntouched
+    {
+        public static int s_int;
+    }
+
+    // Not used by program code at all.
+    public class NoCctorUntouchedAssign
     {
         public static int s_int;
     }
@@ -324,8 +337,8 @@ namespace MITestStaticFields
                 Context.GetAndCheckValue(@"__FILE__:__LINE__", noFuncEval, "NoCctor.t_int", "int", "21");
                 Context.GetAndCheckValue(@"__FILE__:__LINE__", noFuncEval, "NoCctor.t_string", "string", "\\\"t_string\\\"");
                 Context.GetAndCheckValue(@"__FILE__:__LINE__", noFuncEval, "NoCctorThreadStorage.t_long0", "long", "60");
-                Context.GetAndCheckValue(@"__FILE__:__LINE__", defaultFlags, "NoCctorUntouched.s_int", "int", "0", "noneditable");
-                Context.GetAndCheckValue(@"__FILE__:__LINE__", noFuncEval, "NoCctorUntouched.s_int", "int", "0", "noneditable");
+                Context.GetAndCheckValue(@"__FILE__:__LINE__", defaultFlags, "NoCctorUntouched.s_int", "int", "0");
+                Context.GetAndCheckValue(@"__FILE__:__LINE__", noFuncEval, "NoCctorUntouched.s_int", "int", "0");
                 Context.GetAndCheckStaticMemberValue(@"__FILE__:__LINE__", defaultFlags, "noCctor", "s_int", "int", "11");
                 Context.GetAndCheckStaticMemberValue(@"__FILE__:__LINE__", noFuncEval, "noCctor", "t_int", "int", "21");
 
@@ -340,6 +353,12 @@ namespace MITestStaticFields
 
                 // No evaluation (no object creation in debuggee) during "bp_main" breakpoint stop.
                 Context.GetAndCheckValue(@"__FILE__:__LINE__", Context.enum_EVALFLAGS.EVAL_NONE, "allocMain", "long", "0");
+
+                // Change static field of type that was never used by program code (debugger use type object for this).
+                var noFuncEval = Context.enum_EVALFLAGS.EVAL_NOFUNCEVAL;
+                string varName = Context.GetAndCheckValue(@"__FILE__:__LINE__", noFuncEval, "NoCctorUntouchedAssign.s_int", "int", "0");
+                Context.AssignVar(@"__FILE__:__LINE__", varName, "5");
+                Context.GetAndCheckValue(@"__FILE__:__LINE__", noFuncEval, "NoCctorUntouchedAssign.s_int", "int", "5");
 
                 Context.Continue(@"__FILE__:__LINE__");
             });
@@ -356,8 +375,7 @@ namespace MITestStaticFields
 
                 // Type with static constructor: static constructor run before static field access, even with EVAL_NOFUNCEVAL.
                 var noFuncEval = Context.enum_EVALFLAGS.EVAL_NOFUNCEVAL;
-                // Note, class was not used by program code yet (static field don't have storage).
-                Context.GetAndCheckValue(@"__FILE__:__LINE__", noFuncEval, "Counters.cctor_runs", "int", "0", "noneditable");
+                Context.GetAndCheckValue(@"__FILE__:__LINE__", noFuncEval, "Counters.cctor_runs", "int", "0");
                 Context.GetAndCheckValue(@"__FILE__:__LINE__", noFuncEval, "WithCctor.s_int", "int", "5");
                 Context.GetAndCheckValue(@"__FILE__:__LINE__", noFuncEval, "Counters.cctor_runs", "int", "1");
 
@@ -381,17 +399,18 @@ namespace MITestStaticFields
                 Context Context = (Context)context;
                 Context.WasBreakpointHit(@"__FILE__:__LINE__", "bp_worker");
 
-                // Thread static fields never accessed by this thread have default value and can't be changed.
+                // Thread static fields never accessed by this thread have default value and can't be changed (debugger use type
+                // object, but storage is still not allocated).
                 var noFuncEval = Context.enum_EVALFLAGS.EVAL_NOFUNCEVAL;
                 var defaultFlags = Context.enum_EVALFLAGS.EVAL_NONE;
                 Context.GetAndCheckValue(@"__FILE__:__LINE__", defaultFlags, "NoCctor.s_int", "int", "11");
                 // Note, depending on runtime, storage for small thread static field could be preallocated for all threads.
                 Context.GetAndCheckValue(@"__FILE__:__LINE__", noFuncEval, "NoCctor.t_int", "int", "0", null);
-                Context.GetAndCheckValue(@"__FILE__:__LINE__", noFuncEval, "NoCctor.t_string", "string", "null", "noneditable");
-                Context.GetAndCheckValue(@"__FILE__:__LINE__", defaultFlags, "NoCctor.t_string", "string", "null", "noneditable");
-                string varName = Context.GetAndCheckValue(@"__FILE__:__LINE__", noFuncEval, "NoCctorThreadStorage.t_long0", "long", "0", "noneditable");
+                Context.GetAndCheckValue(@"__FILE__:__LINE__", noFuncEval, "NoCctor.t_string", "string", "null");
+                Context.GetAndCheckValue(@"__FILE__:__LINE__", defaultFlags, "NoCctor.t_string", "string", "null");
+                string varName = Context.GetAndCheckValue(@"__FILE__:__LINE__", noFuncEval, "NoCctorThreadStorage.t_long0", "long", "0");
                 Context.ErrorAtAssignVar(@"__FILE__:__LINE__", varName, "5");
-                Context.GetAndCheckValue(@"__FILE__:__LINE__", defaultFlags, "NoCctorThreadStorage.t_long0", "long", "0", "noneditable");
+                Context.GetAndCheckValue(@"__FILE__:__LINE__", defaultFlags, "NoCctorThreadStorage.t_long0", "long", "0");
                 Context.GetAndCheckStaticMemberValue(@"__FILE__:__LINE__", noFuncEval, "noCctor", "t_string", "string", "null");
 
                 Context.Continue(@"__FILE__:__LINE__");

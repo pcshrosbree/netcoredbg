@@ -235,6 +235,48 @@ namespace NetcoreDbgTest.Script
             Assert.Equal(ExpectedResult, evaluateResponse.body.result, @"__FILE__:__LINE__"+"\n"+caller_trace);
         }
 
+        // Expected is "<type> <value>" or error message (starts with "error:").
+        public void CheckResult(string caller_trace, Int64 frameId, string Expression, string Expected)
+        {
+            if (Expected.StartsWith("error:"))
+            {
+                CheckErrorAtRequest(@"__FILE__:__LINE__"+"\n"+caller_trace, frameId, Expression, Expected);
+                return;
+            }
+            int separator = Expected.LastIndexOf(' ');
+            GetAndCheckValue(@"__FILE__:__LINE__"+"\n"+caller_trace, frameId, Expression, Expected.Substring(0, separator), Expected.Substring(separator + 1));
+        }
+
+        public void SetExpressionResult(string caller_trace, Int64 frameId, string Expression, string Value, bool Success)
+        {
+            if (Success)
+                SetExpression(@"__FILE__:__LINE__"+"\n"+caller_trace, frameId, Expression, Value);
+            else
+                ErrorSetExpression(@"__FILE__:__LINE__"+"\n"+caller_trace, frameId, Expression, Value);
+        }
+
+        public void SetVariableResult(string caller_trace, int variablesReference, string Name, string Value, bool Success)
+        {
+            if (Success)
+                SetVariable(@"__FILE__:__LINE__"+"\n"+caller_trace, variablesReference, Name, Value);
+            else
+                ErrorSetVariable(@"__FILE__:__LINE__"+"\n"+caller_trace, variablesReference, Name, Value);
+        }
+
+        public string GetVariable(string caller_trace, Int64 frameId, string Expression)
+        {
+            EvaluateRequest evaluateRequest = new EvaluateRequest();
+            evaluateRequest.arguments.expression = Expression;
+            evaluateRequest.arguments.frameId = frameId;
+            var ret = VSCodeDebugger.Request(evaluateRequest);
+            Assert.True(ret.Success, @"__FILE__:__LINE__"+"\n"+caller_trace);
+
+            EvaluateResponse evaluateResponse =
+                JsonConvert.DeserializeObject<EvaluateResponse>(ret.ResponseStr);
+
+            return evaluateResponse.body.result;
+        }
+
         public void CheckErrorAtRequest(string caller_trace, Int64 frameId, string Expression, string errMsgStart)
         {
             EvaluateRequest evaluateRequest = new EvaluateRequest();
@@ -249,21 +291,6 @@ namespace NetcoreDbgTest.Script
             Assert.True(evaluateResponse.message.StartsWith(errMsgStart), @"__FILE__:__LINE__"+"\n"+caller_trace);
         }
 
-        public void CheckNotValue(string caller_trace, Int64 frameId, string Expression, string NotExpectedResult)
-        {
-            EvaluateRequest evaluateRequest = new EvaluateRequest();
-            evaluateRequest.arguments.expression = Expression;
-            evaluateRequest.arguments.frameId = frameId;
-            var ret = VSCodeDebugger.Request(evaluateRequest);
-            if (!ret.Success)
-                return;
-
-            EvaluateResponse evaluateResponse =
-                JsonConvert.DeserializeObject<EvaluateResponse>(ret.ResponseStr);
-
-            Assert.NotEqual(NotExpectedResult, evaluateResponse.body.result, @"__FILE__:__LINE__"+"\n"+caller_trace);
-        }
-
         public void EvalVariable(string caller_trace, int variablesReference, string Type, string Name, string Value)
         {
             VariablesRequest variablesRequest = new VariablesRequest();
@@ -276,7 +303,8 @@ namespace NetcoreDbgTest.Script
 
             foreach (var Variable in variablesResponse.body.variables) {
                 if (Variable.name == Name) {
-                    Assert.Equal(Type, Variable.type, @"__FILE__:__LINE__"+"\n"+caller_trace);
+                    if (Type != null)
+                        Assert.Equal(Type, Variable.type, @"__FILE__:__LINE__"+"\n"+caller_trace);
                     Assert.Equal(Value, Variable.value, @"__FILE__:__LINE__"+"\n"+caller_trace);
                     return;
                 }
@@ -308,6 +336,7 @@ namespace NetcoreDbgTest.Script
             SetExpressionRequest setExpressionRequest = new SetExpressionRequest();
             setExpressionRequest.arguments.expression = Expression;
             setExpressionRequest.arguments.value = Value;
+            setExpressionRequest.arguments.frameId = (int)frameId;
             Assert.True(VSCodeDebugger.Request(setExpressionRequest).Success, @"__FILE__:__LINE__"+"\n"+caller_trace);
         }
 
@@ -316,6 +345,7 @@ namespace NetcoreDbgTest.Script
             SetExpressionRequest setExpressionRequest = new SetExpressionRequest();
             setExpressionRequest.arguments.expression = Expression;
             setExpressionRequest.arguments.value = Value;
+            setExpressionRequest.arguments.frameId = (int)frameId;
             Assert.False(VSCodeDebugger.Request(setExpressionRequest).Success, @"__FILE__:__LINE__"+"\n"+caller_trace);
         }
 
@@ -357,12 +387,41 @@ namespace VSCodeTestStaticFields
         public int field_i;
     }
 
+    public interface IRef
+    {
+    }
+
+    public class RefImpl : IRef
+    {
+    }
+
+    public class Outer
+    {
+        public class Inner
+        {
+        }
+    }
+
+    // Same simple name as NetcoreDbgTest.ControlInfo from loaded NetcoreDbgTest assembly.
+    public class ControlInfo
+    {
+    }
+
+    public enum TestEnum
+    {
+        One,
+        Two
+    }
+
     public class NoCctor
     {
         public static int s_int;
         public static string s_string;
         public static RefClass s_ref;
         public static ValStruct s_struct;
+        public static IRef s_iface;
+        public static Outer.Inner s_inner;
+        public static ControlInfo s_collide;
 
         [ThreadStatic] public static int t_int;
         [ThreadStatic] public static long t_long;
@@ -372,49 +431,50 @@ namespace VSCodeTestStaticFields
         [ThreadStatic] public static object t_object;
         [ThreadStatic] public static RefClass t_ref;
         [ThreadStatic] public static volatile RefClass t_volatile_ref;
+        [ThreadStatic] public static IRef t_iface;
+        [ThreadStatic] public static Outer.Inner t_inner;
+        [ThreadStatic] public static ControlInfo t_collide;
+        [ThreadStatic] public static System.Text.StringBuilder t_other_module_ref;
         [ThreadStatic] public static List<int> t_list;
         [ThreadStatic] public static ValStruct t_struct;
         [ThreadStatic] public static int[] t_array;
 
         public int field_i = 2;
-
-        public static void StaticMethod()
-        {
-            long allocBefore = GC.GetAllocatedBytesForCurrentThread();
-            int dummy1 = 1;                                                 Label.Breakpoint("bp_static_method");
-            long allocStaticMethod = GC.GetAllocatedBytesForCurrentThread() - allocBefore;
-
-            Label.Checkpoint("bp_static_method", "bp_static_method_alloc", (Object context) => {
-                Context Context = (Context)context;
-                Context.WasBreakpointHit(@"__FILE__:__LINE__", "bp_static_method");
-                Int64 frameId = Context.DetectFrameId(@"__FILE__:__LINE__", "bp_static_method");
-
-                // Static members of method's class.
-                Context.GetAndCheckValue(@"__FILE__:__LINE__", frameId, "s_int", "int", "111");
-                Context.GetAndCheckValue(@"__FILE__:__LINE__", frameId, "t_int", "int", "121");
-                Context.GetAndCheckValue(@"__FILE__:__LINE__", frameId, "s_ref.field_i", "int", "1");
-
-                Context.Continue(@"__FILE__:__LINE__");
-            });
-
-            int dummy2 = 2;                                                 Label.Breakpoint("bp_static_method_alloc");
-
-            Label.Checkpoint("bp_static_method_alloc", "bp_worker", (Object context) => {
-                Context Context = (Context)context;
-                Context.WasBreakpointHit(@"__FILE__:__LINE__", "bp_static_method_alloc");
-                Int64 frameId = Context.DetectFrameId(@"__FILE__:__LINE__", "bp_static_method_alloc");
-
-                // No evaluation (no object creation in debuggee) during "bp_static_method" breakpoint stop.
-                Context.GetAndCheckValue(@"__FILE__:__LINE__", frameId, "allocStaticMethod", "long", "0");
-
-                Context.Continue(@"__FILE__:__LINE__");
-            });
-        }
     }
 
     // Thread static fields with storage, that allocated at first access by thread.
     public class NoCctorThreadStorage
     {
+        [ThreadStatic] public static long t_long0;
+        [ThreadStatic] public static long t_long1;
+        [ThreadStatic] public static long t_long2;
+        [ThreadStatic] public static long t_long3;
+        [ThreadStatic] public static long t_long4;
+        [ThreadStatic] public static long t_long5;
+        [ThreadStatic] public static long t_long6;
+        [ThreadStatic] public static long t_long7;
+    }
+
+    // Used by debugger only at worker thread breakpoint.
+    public class NoCctorWorker
+    {
+        public static int s_int;
+        [ThreadStatic] public static long t_long0;
+        [ThreadStatic] public static long t_long1;
+        [ThreadStatic] public static long t_long2;
+        [ThreadStatic] public static long t_long3;
+        [ThreadStatic] public static long t_long4;
+        [ThreadStatic] public static long t_long5;
+        [ThreadStatic] public static long t_long6;
+        [ThreadStatic] public static long t_long7;
+        [ThreadStatic] public static string t_string;
+    }
+
+    // Used by debugger only at second worker thread breakpoint.
+    public class NoCctorWorker2
+    {
+        [ThreadStatic] public static string t_string;
+        [ThreadStatic] public static RefClass t_ref;
         [ThreadStatic] public static long t_long0;
         [ThreadStatic] public static long t_long1;
         [ThreadStatic] public static long t_long2;
@@ -441,6 +501,38 @@ namespace VSCodeTestStaticFields
         [ThreadStatic] public static int t_int;
     }
 
+    // Not used by program code at all, default values of these types can't be created without evaluation.
+    public class NoCctorUntouchedFallback
+    {
+        public static ValStruct s_struct;
+        public static int[] s_array;
+        public static IntPtr s_nint;
+        public static TestEnum s_enum;
+    }
+
+    // Static fields not used by program code.
+    public class NoCctorInstanceOnly
+    {
+        public static int s_int;
+        public static string s_string;
+
+        public int field_i = 3;
+    }
+
+    // Not used by program code at all.
+    public class NoCctorUntouchedAssign
+    {
+        public static int s_int;
+        public static string s_string;
+    }
+
+    public class NoCctorConsts
+    {
+        public const int c_int = 3;
+        public const string c_string = "const";
+        public const TestEnum c_enum = TestEnum.Two;
+    }
+
     public class NoCctorBase
     {
         public static int base_s_int;
@@ -456,6 +548,46 @@ namespace VSCodeTestStaticFields
         public static int s_int;
         public static int s_prop { get { return s_int + 1; } }
         public static int GetInt() { return s_int + 2; }
+    }
+
+    public class NoCctorMethodHolder
+    {
+        public static int s_int;
+        public static RefClass s_ref;
+        [ThreadStatic] public static string t_string;
+
+        public static void StaticMethod()
+        {
+            long allocBefore = GC.GetAllocatedBytesForCurrentThread();
+            int dummy1 = 1;                                                 Label.Breakpoint("bp_static_method");
+            long allocStaticMethod = GC.GetAllocatedBytesForCurrentThread() - allocBefore;
+
+            Label.Checkpoint("bp_static_method", "bp_static_method_alloc", (Object context) => {
+                Context Context = (Context)context;
+                Context.WasBreakpointHit(@"__FILE__:__LINE__", "bp_static_method");
+                Int64 frameId = Context.DetectFrameId(@"__FILE__:__LINE__", "bp_static_method");
+
+                // Static members of method's class (first access by debugger).
+                Context.GetAndCheckValue(@"__FILE__:__LINE__", frameId, "s_int", "int", "81");
+                Context.GetAndCheckValue(@"__FILE__:__LINE__", frameId, "t_string", "string", "\"holder\"");
+                Context.GetAndCheckValue(@"__FILE__:__LINE__", frameId, "s_ref.field_i", "int", "1");
+
+                Context.Continue(@"__FILE__:__LINE__");
+            });
+
+            int dummy2 = 2;                                                 Label.Breakpoint("bp_static_method_alloc");
+
+            Label.Checkpoint("bp_static_method_alloc", "bp_worker", (Object context) => {
+                Context Context = (Context)context;
+                Context.WasBreakpointHit(@"__FILE__:__LINE__", "bp_static_method_alloc");
+                Int64 frameId = Context.DetectFrameId(@"__FILE__:__LINE__", "bp_static_method_alloc");
+
+                // No evaluation (no object creation in debuggee) during "bp_static_method" breakpoint stop.
+                Context.GetAndCheckValue(@"__FILE__:__LINE__", frameId, "allocStaticMethod", "long", "0");
+
+                Context.Continue(@"__FILE__:__LINE__");
+            });
+        }
     }
 
     // Generic type without static constructor, debugger use type object for generic types.
@@ -474,6 +606,7 @@ namespace VSCodeTestStaticFields
         public static int cctor_runs;
         public static int generic_cctor_runs;
         public static int base_cctor_runs;
+        public static int base2_cctor_runs;
     }
 
     // Types below have static constructor, debugger should run it before static fields access (type object creation).
@@ -526,6 +659,22 @@ namespace VSCodeTestStaticFields
         public static int derived_s_int;
     }
 
+    // Not used by program code at all, base static constructor not run before debugger access.
+    public class BaseWithCctor2
+    {
+        public static int base2_s_int = 9;
+
+        static BaseWithCctor2()
+        {
+            Counters.base2_cctor_runs++;
+        }
+    }
+
+    public class DerivedNoCctor2 : BaseWithCctor2
+    {
+        public static int derived2_s_int;
+    }
+
     class Program
     {
         static void Main(string[] args)
@@ -539,8 +688,9 @@ namespace VSCodeTestStaticFields
                 Context.AddBreakpoint(@"__FILE__:__LINE__", "bp_static_method_alloc");
                 Context.AddBreakpoint(@"__FILE__:__LINE__", "bp_worker");
                 Context.AddBreakpoint(@"__FILE__:__LINE__", "bp_worker_alloc");
+                Context.AddBreakpoint(@"__FILE__:__LINE__", "bp_worker2");
+                Context.AddBreakpoint(@"__FILE__:__LINE__", "bp_worker2_alloc");
                 Context.AddBreakpoint(@"__FILE__:__LINE__", "bp_cctor");
-                Context.AddBreakpoint(@"__FILE__:__LINE__", "bp_cctor_alloc");
                 Context.SetBreakpoints(@"__FILE__:__LINE__");
                 Context.PrepareEnd(@"__FILE__:__LINE__");
                 Context.WasEntryPointHit(@"__FILE__:__LINE__");
@@ -559,6 +709,10 @@ namespace VSCodeTestStaticFields
             NoCctor.t_object = new RefClass();
             NoCctor.t_ref = new RefClass();
             NoCctor.t_volatile_ref = new RefClass();
+            NoCctor.t_iface = new RefImpl();
+            NoCctor.t_inner = new Outer.Inner();
+            NoCctor.t_collide = new ControlInfo();
+            NoCctor.t_other_module_ref = new System.Text.StringBuilder();
             NoCctor.t_list = new List<int>();
             NoCctor.t_struct.field_i = 23;
             NoCctor.t_array = new int[] { 1, 2 };
@@ -566,6 +720,12 @@ namespace VSCodeTestStaticFields
             NoCctorStruct.t_int = 32;
             NoCctorThreadStorage.t_long0 = 60;
             NoCctorThreadStorage.t_long7 = 67;
+            NoCctorWorker.s_int = 90;
+            NoCctorWorker.t_long0 = 80;
+            NoCctorWorker.t_string = "main";
+            NoCctorMethodHolder.s_int = 81;
+            NoCctorMethodHolder.s_ref = new RefClass();
+            NoCctorMethodHolder.t_string = "holder";
             NoCctorMembers.s_int = 50;
             DerivedNoCctor.derived_s_int = 51;
             NoCctorBase.base_s_int = 70;
@@ -583,6 +743,7 @@ namespace VSCodeTestStaticFields
             NoCctorGeneric<int> noCctorGeneric = new NoCctorGeneric<int>();
             DerivedNoCctor derivedNoCctor = new DerivedNoCctor();
             DerivedFromNoCctor derivedFromNoCctor = new DerivedFromNoCctor();
+            NoCctorInstanceOnly noCctorInstanceOnly = new NoCctorInstanceOnly();
 
             long allocBefore = GC.GetAllocatedBytesForCurrentThread();
             int dummy1 = 1;                                                 Label.Breakpoint("bp_main");
@@ -600,6 +761,9 @@ namespace VSCodeTestStaticFields
                 Context.GetAndCheckValue(@"__FILE__:__LINE__", frameId, "NoCctor.s_ref.field_i", "int", "1");
                 Context.GetAndCheckValue(@"__FILE__:__LINE__", frameId, "NoCctor.s_struct", "VSCodeTestStaticFields.ValStruct", "{VSCodeTestStaticFields.ValStruct}");
                 Context.GetAndCheckValue(@"__FILE__:__LINE__", frameId, "NoCctor.s_struct.field_i", "int", "12");
+                Context.GetAndCheckValue(@"__FILE__:__LINE__", frameId, "NoCctor.s_iface", "VSCodeTestStaticFields.IRef", "null");
+                Context.GetAndCheckValue(@"__FILE__:__LINE__", frameId, "NoCctor.s_inner", "VSCodeTestStaticFields.Outer.Inner", "null");
+                Context.GetAndCheckValue(@"__FILE__:__LINE__", frameId, "NoCctor.s_collide", "VSCodeTestStaticFields.ControlInfo", "null");
                 Context.GetAndCheckValue(@"__FILE__:__LINE__", frameId, "NoCctor.t_int", "int", "21");
                 Context.GetAndCheckValue(@"__FILE__:__LINE__", frameId, "NoCctor.t_long", "long", "22");
                 Context.GetAndCheckValue(@"__FILE__:__LINE__", frameId, "NoCctor.t_bool", "bool", "true");
@@ -608,6 +772,9 @@ namespace VSCodeTestStaticFields
                 Context.GetAndCheckValue(@"__FILE__:__LINE__", frameId, "NoCctor.t_object", "VSCodeTestStaticFields.RefClass", "{VSCodeTestStaticFields.RefClass}");
                 Context.GetAndCheckValue(@"__FILE__:__LINE__", frameId, "NoCctor.t_ref", "VSCodeTestStaticFields.RefClass", "{VSCodeTestStaticFields.RefClass}");
                 Context.GetAndCheckValue(@"__FILE__:__LINE__", frameId, "NoCctor.t_volatile_ref", "VSCodeTestStaticFields.RefClass", "{VSCodeTestStaticFields.RefClass}");
+                Context.GetAndCheckValue(@"__FILE__:__LINE__", frameId, "NoCctor.t_iface", "VSCodeTestStaticFields.RefImpl", "{VSCodeTestStaticFields.RefImpl}");
+                Context.GetAndCheckValue(@"__FILE__:__LINE__", frameId, "NoCctor.t_inner", "VSCodeTestStaticFields.Outer.Inner", "{VSCodeTestStaticFields.Outer.Inner}");
+                Context.GetAndCheckValue(@"__FILE__:__LINE__", frameId, "NoCctor.t_collide", "VSCodeTestStaticFields.ControlInfo", "{VSCodeTestStaticFields.ControlInfo}");
                 Context.GetAndCheckValue(@"__FILE__:__LINE__", frameId, "NoCctor.t_list", "System.Collections.Generic.List<int>", "{System.Collections.Generic.List<int>}");
                 Context.GetAndCheckValue(@"__FILE__:__LINE__", frameId, "NoCctor.t_struct.field_i", "int", "23");
                 Context.GetAndCheckValue(@"__FILE__:__LINE__", frameId, "NoCctor.t_array", "int[]", "{int[2]}");
@@ -646,7 +813,7 @@ namespace VSCodeTestStaticFields
                 Context.EvalVariable(@"__FILE__:__LINE__", staticsReference, "int", "derived_s_int", "71");
                 Context.EvalVariable(@"__FILE__:__LINE__", staticsReference, "int", "base_s_int", "70");
 
-                // Change static and thread static fields.
+                // Change static and thread static fields (with storage).
                 staticsReference = Context.GetStaticMembersReference(@"__FILE__:__LINE__", frameId, "noCctor");
                 Context.SetVariable(@"__FILE__:__LINE__", staticsReference, "s_int", "111");
                 Context.EvalVariable(@"__FILE__:__LINE__", staticsReference, "int", "s_int", "111");
@@ -669,15 +836,40 @@ namespace VSCodeTestStaticFields
                 Context.GetAndCheckValue(@"__FILE__:__LINE__", frameId, "NoCctor.s_int", "int", "111");
                 Context.GetAndCheckValue(@"__FILE__:__LINE__", frameId, "NoCctor.t_int", "int", "121");
 
+                // Type that was never used by program code, default value of field type can't be created without evaluation,
+                // debugger use type object (same as for type with static constructor).
+                Context.GetAndCheckValue(@"__FILE__:__LINE__", frameId, "NoCctorUntouchedFallback.s_struct", "VSCodeTestStaticFields.ValStruct", "{VSCodeTestStaticFields.ValStruct}");
+                Context.GetAndCheckValue(@"__FILE__:__LINE__", frameId, "NoCctorUntouchedFallback.s_struct.field_i", "int", "0");
+                Context.GetAndCheckValue(@"__FILE__:__LINE__", frameId, "NoCctorUntouchedFallback.s_array", "int[]", "null");
+                Context.GetAndCheckValue(@"__FILE__:__LINE__", frameId, "NoCctorUntouchedFallback.s_nint", "IntPtr", "0");
+                Context.GetAndCheckValue(@"__FILE__:__LINE__", frameId, "NoCctorUntouchedFallback.s_enum", "VSCodeTestStaticFields.TestEnum", "One");
+                Context.SetExpression(@"__FILE__:__LINE__", frameId, "NoCctorUntouchedFallback.s_struct.field_i", "5");
+                Context.GetAndCheckValue(@"__FILE__:__LINE__", frameId, "NoCctorUntouchedFallback.s_struct.field_i", "int", "5");
+
+                // Type that was never used by program code, change field.
+                Context.GetAndCheckValue(@"__FILE__:__LINE__", frameId, "NoCctorUntouchedAssign.s_int", "int", "0");
+                Context.SetExpression(@"__FILE__:__LINE__", frameId, "NoCctorUntouchedAssign.s_int", "5");
+                Context.GetAndCheckValue(@"__FILE__:__LINE__", frameId, "NoCctorUntouchedAssign.s_int", "int", "5");
+                Context.GetAndCheckValue(@"__FILE__:__LINE__", frameId, "NoCctorUntouchedAssign.s_string", "string", "null");
+                Context.SetExpression(@"__FILE__:__LINE__", frameId, "NoCctorUntouchedAssign.s_string", "\"assigned\"");
+                Context.GetAndCheckValue(@"__FILE__:__LINE__", frameId, "NoCctorUntouchedAssign.s_string", "string", "\"assigned\"");
+
+                // Static fields not used by program code, change field from variables (static members of variable).
+                int instanceStaticsReference = Context.GetStaticMembersReference(@"__FILE__:__LINE__", frameId, "noCctorInstanceOnly");
+                Context.EvalVariable(@"__FILE__:__LINE__", instanceStaticsReference, "int", "s_int", "0");
+                Context.SetVariable(@"__FILE__:__LINE__", instanceStaticsReference, "s_int", "7");
+                Context.EvalVariable(@"__FILE__:__LINE__", instanceStaticsReference, "int", "s_int", "7");
+                Context.GetAndCheckValue(@"__FILE__:__LINE__", frameId, "NoCctorInstanceOnly.s_int", "int", "7");
+
                 // Generic type without static constructor.
                 Context.GetAndCheckValue(@"__FILE__:__LINE__", frameId, "NoCctorGeneric<int>.s_value", "int", "41");
                 Context.GetAndCheckValue(@"__FILE__:__LINE__", frameId, "NoCctorGeneric<int>.s_int", "int", "42");
                 Context.GetAndCheckValue(@"__FILE__:__LINE__", frameId, "NoCctorGeneric<int>.t_value", "int", "43");
                 Context.GetAndCheckValue(@"__FILE__:__LINE__", frameId, "NoCctorGeneric<int>.t_int", "int", "44");
                 Context.GetAndCheckValue(@"__FILE__:__LINE__", frameId, "NoCctorGeneric<string>.s_value", "string", "\"generic_s_value\"");
-                // Thread static field of shared generic instantiation could be reported by debugger API as not available,
-                // even if field have storage and value, debugger must not show default value for it.
-                Context.CheckNotValue(@"__FILE__:__LINE__", frameId, "NoCctorGeneric<string>.t_value", "null");
+                // Note, debugger API report thread static field of shared generic instantiation as not available.
+                Context.CheckErrorAtRequest(@"__FILE__:__LINE__", frameId, "NoCctorGeneric<string>.t_value",
+                                            "error: The name 'NoCctorGeneric<string>.t_value' does not exist in the current context");
                 Context.GetAndCheckValue(@"__FILE__:__LINE__", frameId, "NoCctorGeneric<long>.s_value", "long", "0");
                 int staticsReference = Context.GetStaticMembersReference(@"__FILE__:__LINE__", frameId, "noCctorGeneric");
                 Context.EvalVariable(@"__FILE__:__LINE__", staticsReference, "int", "s_value", "41");
@@ -689,17 +881,19 @@ namespace VSCodeTestStaticFields
                 Context.Continue(@"__FILE__:__LINE__");
             });
 
-            NoCctor.StaticMethod();
+            NoCctorMethodHolder.StaticMethod();
 
             System.Threading.Thread workerThread = new System.Threading.Thread(WorkerThread);
             workerThread.Start();
             workerThread.Join();
 
-            allocBefore = GC.GetAllocatedBytesForCurrentThread();
-            int dummy3 = 3;                                                 Label.Breakpoint("bp_cctor");
-            long allocCctor = GC.GetAllocatedBytesForCurrentThread() - allocBefore;
+            System.Threading.Thread workerThread2 = new System.Threading.Thread(WorkerThread2);
+            workerThread2.Start();
+            workerThread2.Join();
 
-            Label.Checkpoint("bp_cctor", "bp_cctor_alloc", (Object context) => {
+            int dummy3 = 3;                                                 Label.Breakpoint("bp_cctor");
+
+            Label.Checkpoint("bp_cctor", "finish", (Object context) => {
                 Context Context = (Context)context;
                 Context.WasBreakpointHit(@"__FILE__:__LINE__", "bp_cctor");
                 Int64 frameId = Context.DetectFrameId(@"__FILE__:__LINE__", "bp_cctor");
@@ -712,7 +906,12 @@ namespace VSCodeTestStaticFields
                 Context.GetAndCheckValue(@"__FILE__:__LINE__", frameId, "WithCctorGeneric<int>.s_int", "int", "6");
                 Context.GetAndCheckValue(@"__FILE__:__LINE__", frameId, "Counters.generic_cctor_runs", "int", "1");
 
-                // Base type with static constructor.
+                // Base type with static constructor, that was not run yet, accessed through derived type without static constructor.
+                Context.GetAndCheckValue(@"__FILE__:__LINE__", frameId, "Counters.base2_cctor_runs", "int", "0");
+                Context.GetAndCheckValue(@"__FILE__:__LINE__", frameId, "DerivedNoCctor2.base2_s_int", "int", "9");
+                Context.GetAndCheckValue(@"__FILE__:__LINE__", frameId, "Counters.base2_cctor_runs", "int", "1");
+
+                // Base type with static constructor (already run, since instance was created).
                 Context.GetAndCheckValue(@"__FILE__:__LINE__", frameId, "Counters.base_cctor_runs", "int", "1");
                 Context.GetAndCheckValue(@"__FILE__:__LINE__", frameId, "DerivedNoCctor.derived_s_int", "int", "51");
                 Context.GetAndCheckValue(@"__FILE__:__LINE__", frameId, "DerivedNoCctor.base_s_int", "int", "7");
@@ -724,18 +923,10 @@ namespace VSCodeTestStaticFields
                 Context.GetAndCheckValue(@"__FILE__:__LINE__", frameId, "NoCctorMembers.s_prop", "int", "51");
                 Context.GetAndCheckValue(@"__FILE__:__LINE__", frameId, "NoCctorMembers.GetInt()", "int", "52");
 
-                Context.Continue(@"__FILE__:__LINE__");
-            });
-
-            int dummy4 = 4;                                                 Label.Breakpoint("bp_cctor_alloc");
-
-            Label.Checkpoint("bp_cctor_alloc", "finish", (Object context) => {
-                Context Context = (Context)context;
-                Context.WasBreakpointHit(@"__FILE__:__LINE__", "bp_cctor_alloc");
-                Int64 frameId = Context.DetectFrameId(@"__FILE__:__LINE__", "bp_cctor_alloc");
-
-                // Evaluation (type object creation) was used during "bp_cctor" breakpoint stop.
-                Context.GetAndCheckValue(@"__FILE__:__LINE__", frameId, "allocCctor > 0", "bool", "true");
+                // Constants of type without static constructor.
+                Context.GetAndCheckValue(@"__FILE__:__LINE__", frameId, "NoCctorConsts.c_int", "int", "3");
+                Context.GetAndCheckValue(@"__FILE__:__LINE__", frameId, "NoCctorConsts.c_string", "string", "\"const\"");
+                Context.GetAndCheckValue(@"__FILE__:__LINE__", frameId, "NoCctorConsts.c_enum", "VSCodeTestStaticFields.TestEnum", "Two");
 
                 Context.Continue(@"__FILE__:__LINE__");
             });
@@ -751,6 +942,9 @@ namespace VSCodeTestStaticFields
         {
             NoCctor noCctor = new NoCctor();
             NoCctorThreadStorage noCctorThreadStorage = new NoCctorThreadStorage();
+            NoCctorWorker.t_long1 = 61;
+            NoCctorWorker.t_string = "worker";
+            int runtimeMajor = Environment.Version.Major;
 
             long allocBefore = GC.GetAllocatedBytesForCurrentThread();
             int dummy1 = 1;                                                 Label.Breakpoint("bp_worker");
@@ -760,6 +954,13 @@ namespace VSCodeTestStaticFields
                 Context Context = (Context)context;
                 Context.WasBreakpointHit(@"__FILE__:__LINE__", "bp_worker");
                 Int64 frameId = Context.DetectFrameId(@"__FILE__:__LINE__", "bp_worker");
+
+                // Thread static fields written by this thread have this thread values, static field is shared by all threads
+                // (first access by debugger).
+                Context.GetAndCheckValue(@"__FILE__:__LINE__", frameId, "NoCctorWorker.t_long1", "long", "61");
+                Context.GetAndCheckValue(@"__FILE__:__LINE__", frameId, "NoCctorWorker.t_string", "string", "\"worker\"");
+                Context.GetAndCheckValue(@"__FILE__:__LINE__", frameId, "NoCctorWorker.t_long0", "long", "0");
+                Context.GetAndCheckValue(@"__FILE__:__LINE__", frameId, "NoCctorWorker.s_int", "int", "90");
 
                 // Static fields are shared by all threads.
                 Context.GetAndCheckValue(@"__FILE__:__LINE__", frameId, "NoCctor.s_int", "int", "111");
@@ -774,11 +975,45 @@ namespace VSCodeTestStaticFields
                 Context.GetAndCheckValue(@"__FILE__:__LINE__", frameId, "NoCctor.t_object", "object", "null");
                 Context.GetAndCheckValue(@"__FILE__:__LINE__", frameId, "NoCctor.t_ref", "VSCodeTestStaticFields.RefClass", "null");
                 Context.GetAndCheckValue(@"__FILE__:__LINE__", frameId, "NoCctor.t_volatile_ref", "VSCodeTestStaticFields.RefClass", "null");
+                Context.GetAndCheckValue(@"__FILE__:__LINE__", frameId, "NoCctor.t_iface", "VSCodeTestStaticFields.IRef", "null");
+                Context.GetAndCheckValue(@"__FILE__:__LINE__", frameId, "NoCctor.t_inner", "VSCodeTestStaticFields.Outer.Inner", "null");
+                Context.GetAndCheckValue(@"__FILE__:__LINE__", frameId, "NoCctor.t_collide", "VSCodeTestStaticFields.ControlInfo", "null");
                 Context.GetAndCheckValue(@"__FILE__:__LINE__", frameId, "NoCctorStruct.t_int", "int", "0");
-                // Default value of struct, array and generic type instance can't be created without evaluation.
-                Context.CheckErrorAtRequest(@"__FILE__:__LINE__", frameId, "NoCctor.t_struct", "error");
-                Context.CheckErrorAtRequest(@"__FILE__:__LINE__", frameId, "NoCctor.t_array", "error");
-                Context.CheckErrorAtRequest(@"__FILE__:__LINE__", frameId, "NoCctor.t_list", "error");
+                Context.GetAndCheckValue(@"__FILE__:__LINE__", frameId, "NoCctorThreadStorage.t_long0", "long", "0");
+                Context.GetAndCheckValue(@"__FILE__:__LINE__", frameId, "NoCctorThreadStorage.t_long7", "long", "0");
+
+                // Variables (static members of variable), thread static fields never accessed by this thread have default value.
+                int staticsReference = Context.GetStaticMembersReference(@"__FILE__:__LINE__", frameId, "noCctorThreadStorage");
+                Context.EvalVariable(@"__FILE__:__LINE__", staticsReference, "long", "t_long0", "0");
+                Context.EvalVariable(@"__FILE__:__LINE__", staticsReference, "long", "t_long7", "0");
+
+                Context.Continue(@"__FILE__:__LINE__");
+            });
+
+            int dummy2 = 2;                                                 Label.Breakpoint("bp_worker_alloc");
+
+            Label.Checkpoint("bp_worker_alloc", "bp_worker2", (Object context) => {
+                Context Context = (Context)context;
+                Context.WasBreakpointHit(@"__FILE__:__LINE__", "bp_worker_alloc");
+                Int64 frameId = Context.DetectFrameId(@"__FILE__:__LINE__", "bp_worker_alloc");
+
+                // No evaluation (no object creation in debuggee) during "bp_worker" breakpoint stop.
+                Context.GetAndCheckValue(@"__FILE__:__LINE__", frameId, "allocWorker", "long", "0");
+
+                // Below, default value can't be created without evaluation (or field can't be changed without storage), debugger use
+                // type object, as for type with static constructor. Note, .NET 8 allocate storage for thread static fields of all
+                // types at first thread static field write by thread (this thread write NoCctorWorker fields), so, fields below
+                // already have storage on this thread.
+                bool storage = Context.GetVariable(@"__FILE__:__LINE__", frameId, "runtimeMajor") == "8";
+
+                Context.CheckResult(@"__FILE__:__LINE__", frameId, "NoCctor.t_other_module_ref", storage ? "System.Text.StringBuilder null" :
+                                    "error: The name 'NoCctor.t_other_module_ref' does not exist in the current context");
+                Context.CheckResult(@"__FILE__:__LINE__", frameId, "NoCctor.t_struct",
+                                    "error: The name 'NoCctor.t_struct' does not exist in the current context");
+                Context.CheckResult(@"__FILE__:__LINE__", frameId, "NoCctor.t_array", storage ? "int[] null" :
+                                    "error: The name 'NoCctor.t_array' does not exist in the current context");
+                Context.CheckResult(@"__FILE__:__LINE__", frameId, "NoCctor.t_list", storage ? "System.Collections.Generic.List<int> null" :
+                                    "error: The name 'NoCctor.t_list' does not exist in the current context");
 
                 // Variables (static members of variable), thread static fields never accessed by this thread have default value.
                 int staticsReference = Context.GetStaticMembersReference(@"__FILE__:__LINE__", frameId, "noCctor");
@@ -790,33 +1025,55 @@ namespace VSCodeTestStaticFields
                 Context.EvalVariable(@"__FILE__:__LINE__", staticsReference, "string", "t_string", "null");
                 Context.EvalVariable(@"__FILE__:__LINE__", staticsReference, "object", "t_object", "null");
                 Context.EvalVariable(@"__FILE__:__LINE__", staticsReference, "VSCodeTestStaticFields.RefClass", "t_ref", "null");
+                Context.EvalVariable(@"__FILE__:__LINE__", staticsReference, null, "t_struct", "<error>");
 
-                // Thread static field without storage on this thread have default value and can't be changed.
-                Context.GetAndCheckValue(@"__FILE__:__LINE__", frameId, "NoCctorThreadStorage.t_long0", "long", "0");
-                Context.GetAndCheckValue(@"__FILE__:__LINE__", frameId, "NoCctorThreadStorage.t_long7", "long", "0");
-                Context.ErrorSetExpression(@"__FILE__:__LINE__", frameId, "NoCctorThreadStorage.t_long0", "5");
+                // Change thread static field (storage allocated, if possible).
+                Context.SetExpressionResult(@"__FILE__:__LINE__", frameId, "NoCctorThreadStorage.t_long0", "5", storage);
                 staticsReference = Context.GetStaticMembersReference(@"__FILE__:__LINE__", frameId, "noCctorThreadStorage");
-                Context.EvalVariable(@"__FILE__:__LINE__", staticsReference, "long", "t_long7", "0");
-                Context.ErrorSetVariable(@"__FILE__:__LINE__", staticsReference, "t_long7", "5");
+                Context.SetVariableResult(@"__FILE__:__LINE__", staticsReference, "t_long7", "5", storage);
+                Context.CheckResult(@"__FILE__:__LINE__", frameId, "NoCctorThreadStorage.t_long0", storage ? "long 5" : "long 0");
+                Context.CheckResult(@"__FILE__:__LINE__", frameId, "NoCctorThreadStorage.t_long7", storage ? "long 5" : "long 0");
 
-                // Thread static field without storage on this thread, type with static constructor.
-                Context.CheckErrorAtRequest(@"__FILE__:__LINE__", frameId, "WithCctorThreadStorage.t_long0", "error");
+                // Thread static field never accessed by this thread, type with static constructor.
+                Context.CheckResult(@"__FILE__:__LINE__", frameId, "WithCctorThreadStorage.t_long0", storage ? "long 0" :
+                                    "error: The name 'WithCctorThreadStorage.t_long0' does not exist in the current context");
+
+                Context.Continue(@"__FILE__:__LINE__");
+            });
+        }
+
+        // Thread, that never access thread static fields.
+        static void WorkerThread2()
+        {
+            long allocBefore = GC.GetAllocatedBytesForCurrentThread();
+            int dummy1 = 1;                                                 Label.Breakpoint("bp_worker2");
+            long allocWorker2 = GC.GetAllocatedBytesForCurrentThread() - allocBefore;
+
+            Label.Checkpoint("bp_worker2", "bp_worker2_alloc", (Object context) => {
+                Context Context = (Context)context;
+                Context.WasBreakpointHit(@"__FILE__:__LINE__", "bp_worker2");
+                Int64 frameId = Context.DetectFrameId(@"__FILE__:__LINE__", "bp_worker2");
+
+                // Thread static fields never accessed by this thread have default value (first access by debugger).
+                Context.GetAndCheckValue(@"__FILE__:__LINE__", frameId, "NoCctorWorker2.t_string", "string", "null");
+                Context.GetAndCheckValue(@"__FILE__:__LINE__", frameId, "NoCctorWorker2.t_ref", "VSCodeTestStaticFields.RefClass", "null");
+                Context.GetAndCheckValue(@"__FILE__:__LINE__", frameId, "NoCctorWorker2.t_long0", "long", "0");
+                Context.GetAndCheckValue(@"__FILE__:__LINE__", frameId, "NoCctorWorker2.t_long7", "long", "0");
+                Context.GetAndCheckValue(@"__FILE__:__LINE__", frameId, "NoCctor.t_string", "string", "null");
+                Context.GetAndCheckValue(@"__FILE__:__LINE__", frameId, "NoCctor.t_ref", "VSCodeTestStaticFields.RefClass", "null");
 
                 Context.Continue(@"__FILE__:__LINE__");
             });
 
-            int dummy2 = 2;                                                 Label.Breakpoint("bp_worker_alloc");
+            int dummy2 = 2;                                                 Label.Breakpoint("bp_worker2_alloc");
 
-            Label.Checkpoint("bp_worker_alloc", "bp_cctor", (Object context) => {
+            Label.Checkpoint("bp_worker2_alloc", "bp_cctor", (Object context) => {
                 Context Context = (Context)context;
-                Context.WasBreakpointHit(@"__FILE__:__LINE__", "bp_worker_alloc");
-                Int64 frameId = Context.DetectFrameId(@"__FILE__:__LINE__", "bp_worker_alloc");
+                Context.WasBreakpointHit(@"__FILE__:__LINE__", "bp_worker2_alloc");
+                Int64 frameId = Context.DetectFrameId(@"__FILE__:__LINE__", "bp_worker2_alloc");
 
-                // No evaluation (no object creation in debuggee) during "bp_worker" breakpoint stop.
-                Context.GetAndCheckValue(@"__FILE__:__LINE__", frameId, "allocWorker", "long", "0");
-                // Not changed by debugger at "bp_worker".
-                Context.GetAndCheckValue(@"__FILE__:__LINE__", frameId, "NoCctorThreadStorage.t_long0", "long", "0");
-                Context.GetAndCheckValue(@"__FILE__:__LINE__", frameId, "NoCctorThreadStorage.t_long7", "long", "0");
+                // No evaluation (no object creation in debuggee) during "bp_worker2" breakpoint stop.
+                Context.GetAndCheckValue(@"__FILE__:__LINE__", frameId, "allocWorker2", "long", "0");
 
                 Context.Continue(@"__FILE__:__LINE__");
             });
