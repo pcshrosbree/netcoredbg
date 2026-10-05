@@ -506,6 +506,8 @@ HRESULT Variables::SetChild(
 
         ToRelease<ICorDebugValue> iCorValue;
         IfFailRet(getValue(&iCorValue, ref.evalFlags));
+        if (Status == S_FALSE) // default value of static field without storage, can't be changed
+            return E_FAIL;
         IfFailRet(m_sharedEvaluator->SetValue(pThread, ref.frameId.getLevel(), iCorValue, &getValue, setterData, value, ref.evalFlags, output));
         IfFailRet(PrintValue(iCorValue, output));
         found = true;

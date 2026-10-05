@@ -20,6 +20,7 @@ class Modules;
 class EvalWaiter;
 
 HRESULT FindFunction(ICorDebugModule *pModule, const WCHAR *typeName, const WCHAR *methodName, ICorDebugFunction **ppFunction);
+bool TypeObjectNeeded(ICorDebugType *pType);
 
 class EvalHelpers
 {
@@ -66,6 +67,13 @@ public:
         UVCP_CONSTANT pRawValue,
         ULONG rawValueLength,
         ICorDebugValue **ppLiteralValue);
+
+    HRESULT CreateDefaultValue(
+        ICorDebugThread *pThread,
+        ICorDebugType *pType,
+        ICorDebugModule *pModule,
+        PCCOR_SIGNATURE pSignatureBlob,
+        ICorDebugValue **ppDefaultValue);
 
     HRESULT CreateString(ICorDebugThread *pThread, const std::string &value, ICorDebugValue **ppNewString);
 
