@@ -20,6 +20,7 @@ class Modules;
 class EvalWaiter;
 
 HRESULT FindFunction(ICorDebugModule *pModule, const WCHAR *typeName, const WCHAR *methodName, ICorDebugFunction **ppFunction);
+// Return `false` only for non generic type without static constructor (its static members could be read without type object).
 bool TypeObjectNeeded(ICorDebugType *pType);
 
 class EvalHelpers
@@ -32,11 +33,19 @@ public:
         m_sharedEvalWaiter(sharedEvalWaiter)
     {}
 
+    // Create type object (run type static constructor) before type static members access.
+    // Return S_FALSE without ICorDebugValue creation in case type don't have static members (DetectStaticMembers is true).
+    // Return S_OK without ICorDebugValue creation (*ppTypeObjectResult is not changed) in case type object not needed
+    // (see TypeObjectNeeded()) and ForceCreation is false, static members of this type should be read directly.
+    // Note, static field value getter (see Evaluator::WalkMembers()) return S_FALSE in case value is default value of static
+    // field without storage (class not loaded or storage not allocated yet), in order to change it, type object must be
+    // created with ForceCreation and value must be received again.
     HRESULT CreatTypeObjectStaticConstructor(
         ICorDebugThread *pThread,
         ICorDebugType *pType,
         ICorDebugValue **ppTypeObjectResult = nullptr,
-        bool DetectStaticMembers = true);
+        bool DetectStaticMembers = true,
+        bool ForceCreation = false);
 
     HRESULT EvalFunction(
         ICorDebugThread *pThread,
@@ -68,9 +77,9 @@ public:
         ULONG rawValueLength,
         ICorDebugValue **ppLiteralValue);
 
+    // Create default value of field type without evaluation, E_NOTIMPL in case this is not possible.
     HRESULT CreateDefaultValue(
         ICorDebugThread *pThread,
-        ICorDebugType *pType,
         ICorDebugModule *pModule,
         PCCOR_SIGNATURE pSignatureBlob,
         ICorDebugValue **ppDefaultValue);

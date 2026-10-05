@@ -492,7 +492,7 @@ HRESULT Variables::SetChild(
     bool found = false;
 
     if (FAILED(Status = m_sharedEvaluator->WalkMembers(ref.iCorValue, pThread, ref.frameId.getLevel(), true, [&](
-        ICorDebugType*,
+        ICorDebugType *pType,
         bool is_static,
         const std::string &varName,
         Evaluator::GetValueCallback getValue,
@@ -506,8 +506,15 @@ HRESULT Variables::SetChild(
 
         ToRelease<ICorDebugValue> iCorValue;
         IfFailRet(getValue(&iCorValue, ref.evalFlags));
-        if (Status == S_FALSE) // default value of static field without storage, can't be changed
-            return E_FAIL;
+        if (Status == S_FALSE && !setterData) // default value of static field without storage
+        {
+            // Create type object (allocate static fields storage), as for type with static constructor, and get value again.
+            IfFailRet(m_sharedEvalHelpers->CreatTypeObjectStaticConstructor(pThread, pType, nullptr, false, true));
+            iCorValue.Free();
+            IfFailRet(getValue(&iCorValue, ref.evalFlags));
+            if (Status == S_FALSE) // still don't have storage, can't be changed
+                return E_FAIL;
+        }
         IfFailRet(m_sharedEvaluator->SetValue(pThread, ref.frameId.getLevel(), iCorValue, &getValue, setterData, value, ref.evalFlags, output));
         IfFailRet(PrintValue(iCorValue, output));
         found = true;
@@ -540,6 +547,16 @@ HRESULT Variables::SetExpression(ICorDebugProcess *pProcess, FrameId frameId, co
     bool editable = false;
     std::unique_ptr<Evaluator::SetterData> setterData;
     IfFailRet(m_sharedEvalStackMachine->EvaluateExpression(pThread, frameId.getLevel(), evalFlags, expression, &iCorValue, output, &editable, &setterData));
+    if (setterData && setterData->staticFieldWithoutStorage)
+    {
+        // Default value of static field without storage. Create type object (allocate static fields storage), as for type with
+        // static constructor, and evaluate expression again.
+        IfFailRet(m_sharedEvalHelpers->CreatTypeObjectStaticConstructor(pThread, setterData->propertyType, nullptr, false, true));
+        iCorValue.Free();
+        setterData.reset();
+        // Note, in case value still don't have storage, setterData without setter function prevent value change below.
+        IfFailRet(m_sharedEvalStackMachine->EvaluateExpression(pThread, frameId.getLevel(), evalFlags, expression, &iCorValue, output, &editable, &setterData));
+    }
     if (!editable ||
         (editable && setterData.get() && !setterData.get()->setterFunction)) // property, that don't have setter
     {

@@ -349,7 +349,8 @@ HRESULT EvalHelpers::CreatTypeObjectStaticConstructor(
     ICorDebugThread *pThread,
     ICorDebugType *pType,
     ICorDebugValue **ppTypeObjectResult,
-    bool DetectStaticMembers)
+    bool DetectStaticMembers,
+    bool ForceCreation)
 {
     HRESULT Status;
 
@@ -369,7 +370,7 @@ HRESULT EvalHelpers::CreatTypeObjectStaticConstructor(
         return S_FALSE;
 
     // Note, in case type object not needed, S_OK returned without ICorDebugValue creation.
-    if (!TypeObjectNeeded(pType))
+    if (!ForceCreation && !TypeObjectNeeded(pType))
         return S_OK;
 
     std::vector< ToRelease<ICorDebugType> > typeParams;
@@ -611,15 +612,13 @@ HRESULT EvalHelpers::GetLiteralValue(
 
 // Create default value (null or zero) of field type without evaluation.
 // [in] pThread - managed thread;
-// [in] pType - type that declare field;
 // [in] pModule - module of type that declare field;
 // [in] pSignatureBlob - field signature;
 // [out] ppDefaultValue - return value.
-// Note, only zero value of primitive type and null reference (except array and generic type instance) could be created
-// without evaluation, for all other types E_NOTIMPL returned.
+// Note, only zero value of primitive type and null reference of object, string or class declared in the same module could be
+// created without evaluation (with exact type), for all other types E_NOTIMPL returned.
 HRESULT EvalHelpers::CreateDefaultValue(
     ICorDebugThread *pThread,
-    ICorDebugType *pType,
     ICorDebugModule *pModule,
     PCCOR_SIGNATURE pSignatureBlob,
     ICorDebugValue **ppDefaultValue)
@@ -637,9 +636,6 @@ HRESULT EvalHelpers::CreateDefaultValue(
         CorSigUncompressElementType(pSignatureBlob, &elementType);
     }
 
-    ToRelease<ICorDebugEval> pEval;
-    IfFailRet(pThread->CreateEval(&pEval));
-
     switch (elementType)
     {
         case ELEMENT_TYPE_OBJECT:
@@ -655,25 +651,40 @@ HRESULT EvalHelpers::CreateDefaultValue(
         case ELEMENT_TYPE_U8:
         case ELEMENT_TYPE_R4:
         case ELEMENT_TYPE_R8:
+        {
+            ToRelease<ICorDebugEval> pEval;
+            IfFailRet(pThread->CreateEval(&pEval));
             // Note, ELEMENT_TYPE_CLASS without class is System.Object.
             return pEval->CreateValue(elementType == ELEMENT_TYPE_OBJECT ? ELEMENT_TYPE_CLASS : elementType, nullptr, ppDefaultValue);
+        }
         case ELEMENT_TYPE_STRING:
-        case ELEMENT_TYPE_CLASS:
         {
-            ToRelease<IUnknown> pMDUnknown;
-            IfFailRet(pModule->GetMetaDataInterface(IID_IMetaDataImport, &pMDUnknown));
-            ToRelease<IMetaDataImport> pMD;
-            IfFailRet(pMDUnknown->QueryInterface(IID_IMetaDataImport, (LPVOID*) &pMD));
+            ToRelease<ICorDebugType> pStringType;
+            IfFailRet(EvalUtils::GetType("string", pThread, m_sharedModules.get(), &pStringType));
 
-            std::string typeName;
-            TypePrinter::NameForTypeSig(pSignatureBlob, pType, pMD, typeName);
-            ToRelease<ICorDebugType> pFieldType;
-            IfFailRet(EvalUtils::GetType(typeName, pThread, m_sharedModules.get(), &pFieldType));
-
+            ToRelease<ICorDebugEval> pEval;
+            IfFailRet(pThread->CreateEval(&pEval));
             ToRelease<ICorDebugEval2> pEval2;
             IfFailRet(pEval->QueryInterface(IID_ICorDebugEval2, (LPVOID*) &pEval2));
-            return pEval2->CreateValueForType(pFieldType, ppDefaultValue);
+            return pEval2->CreateValueForType(pStringType, ppDefaultValue);
         }
+        case ELEMENT_TYPE_CLASS:
+        {
+            // Note, class from other module (TypeRef token) can't be resolved exactly here.
+            mdToken tk;
+            CorSigUncompressElementType(pSignatureBlob);
+            CorSigUncompressToken(pSignatureBlob, &tk);
+            if (TypeFromToken(tk) != mdtTypeDef)
+                return E_NOTIMPL;
+
+            ToRelease<ICorDebugClass> pClass;
+            IfFailRet(pModule->GetClassFromToken(tk, &pClass));
+
+            ToRelease<ICorDebugEval> pEval;
+            IfFailRet(pThread->CreateEval(&pEval));
+            return pEval->CreateValue(ELEMENT_TYPE_CLASS, pClass, ppDefaultValue);
+        }
+        // Note, native integers (ELEMENT_TYPE_I, ELEMENT_TYPE_U) are not supported by ICorDebugEval::CreateValue().
         default:
             return E_NOTIMPL;
     }

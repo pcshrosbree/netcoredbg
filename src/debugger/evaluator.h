@@ -54,6 +54,9 @@ public:
         ToRelease<ICorDebugValue> thisValue;
         ToRelease<ICorDebugType> propertyType;
         ToRelease<ICorDebugFunction> setterFunction;
+        // Value is default value of static field, that don't have storage yet (type without static constructor), propertyType
+        // is type that declare field. In order to change value, type object must be created first and value received again.
+        bool staticFieldWithoutStorage = false;
 
         SetterData(ICorDebugValue *pValue, ICorDebugType *pType, ICorDebugFunction *pFunction)
         {
@@ -63,6 +66,7 @@ public:
         SetterData(SetterData &setterData)
         {
             Set(setterData.thisValue.GetPtr(), setterData.propertyType.GetPtr(), setterData.setterFunction.GetPtr());
+            staticFieldWithoutStorage = setterData.staticFieldWithoutStorage;
         };
 
         void Set(ICorDebugValue *pValue, ICorDebugType *pType, ICorDebugFunction *pFunction)

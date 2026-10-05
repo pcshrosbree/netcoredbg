@@ -866,11 +866,24 @@ static HRESULT InternalWalkMembers(EvalHelpers *pEvalHelpers, ICorDebugValue *pI
                     // Class could be not loaded yet or storage for static field could be not allocated yet (for example, thread static
                     // field never accessed by this thread). In case type don't need type object (don't have static constructor), nothing
                     // could write field before this, so, field have default value.
-                    // Return S_FALSE, since this value don't have storage and can't be changed.
-                    if ((Status == CORDBG_E_STATIC_VAR_NOT_AVAILABLE || Status == CORDBG_E_CLASS_NOT_LOADED) &&
-                        !TypeObjectNeeded(pType) &&
-                        SUCCEEDED(pEvalHelpers->CreateDefaultValue(pThread, pType, pModule, pSignatureBlob, ppResultValue)))
-                        return S_FALSE;
+                    if ((Status == CORDBG_E_STATIC_VAR_NOT_AVAILABLE || Status == CORDBG_E_CLASS_NOT_LOADED) && !TypeObjectNeeded(pType))
+                    {
+                        // Return S_FALSE, since this value don't have storage.
+                        // Note, RVA field have initial value from image, not default value.
+                        if (!(fieldAttr & fdHasFieldRVA) &&
+                            SUCCEEDED(pEvalHelpers->CreateDefaultValue(pThread, pModule, pSignatureBlob, ppResultValue)))
+                            return S_FALSE;
+
+                        // Default value can't be created without evaluation, create type object (load class and allocate static
+                        // fields storage) and read field again, as for type with static constructor.
+                        IfFailRet(pEvalHelpers->CreatTypeObjectStaticConstructor(pThread, pType, nullptr, false, true));
+                        // Get pFrame again, since it was neutered at eval call.
+                        pFrame.Free();
+                        IfFailRet(GetFrameAt(pThread, frameLevel, &pFrame));
+                        if (pFrame == nullptr)
+                            return E_FAIL;
+                        Status = pType->GetStaticFieldValue(fieldDef, pFrame, ppResultValue);
+                    }
 
                     IfFailRet(Status);
                 }
@@ -1610,8 +1623,11 @@ static HRESULT FollowFields(EvalHelpers *pEvalHelpers, ICorDebugThread *pThread,
             IfFailRet(getValue(&pResultValue, evalFlags));
             if (setterData && resultSetterData)
                 (*resultSetterData).reset(new Evaluator::SetterData(*setterData));
-            else if (Status == S_FALSE && resultSetterData) // default value of static field without storage, can't be changed
-                (*resultSetterData).reset(new Evaluator::SetterData(nullptr, nullptr, nullptr));
+            else if (Status == S_FALSE && resultSetterData) // default value of static field without storage
+            {
+                (*resultSetterData).reset(new Evaluator::SetterData(nullptr, pType, nullptr));
+                (*resultSetterData)->staticFieldWithoutStorage = true;
+            }
 
             return E_ABORT; // Fast exit from cycle with result.
         });
