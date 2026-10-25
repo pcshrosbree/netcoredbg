@@ -35,6 +35,8 @@ class Modules;
 // At an exception stop the reader appends to the DAP `exceptionInfo` description the newest entry, in each store,
 // whose `Exception` is the current exception object (compared by address). It searches the stopped thread first and,
 // for a store with no match there, every other managed thread (an exception can be rethrown on another thread).
+// If no entry is for the current exception, the nearest of its inner exceptions with one is shown. If nothing is
+// found, the reader says so when it can't rule an entry out: a ring has wrapped, or the search was cut short.
 //
 // The reader never runs code in the debuggee: it reads fields with ICorDebugClass::GetStaticFieldValue and
 // ICorDebugObjectValue::GetFieldValue only, never through the expression evaluator (which creates a type object
@@ -119,6 +121,24 @@ private:
         ToRelease<ICorDebugFrame> pFrame;
     };
 
+    // One read of a store's ring on one thread.
+    struct RingRead
+    {
+        size_t link = SIZE_MAX;     // position in the exception chain of the matched entry's exception; SIZE_MAX: none
+        std::string text;
+        bool wrapped = false;       // more entries were recorded than the ring holds
+    };
+
+    // The current exception and its inner exceptions, read only if a ring holds entries for other exceptions or
+    // nothing matched.
+    struct ExceptionChain
+    {
+        ICorDebugValue *pException = nullptr;
+        std::vector<CORDB_ADDRESS> links;   // links[0] is the current exception
+        bool read = false;                  // links[1...] have been read
+        std::string incomplete;             // why the chain may go on past links, or empty
+    };
+
     std::shared_ptr<Modules> m_sharedModules;
 
     std::mutex m_mutex;
@@ -135,14 +155,16 @@ private:
     HRESULT AppendExceptionAnnotationsImpl(ICorDebugThread *pThread, std::string &suffix);
     HRESULT GetStores(std::vector<StoreRef> &stores);
     bool ScanModule(ICorDebugModule *pModule, std::vector<Store> &stores);
-    HRESULT FindMatchOnThread(StoreRef &ref, ICorDebugFrame *pFrame, CORDB_ADDRESS exceptionAddress, bool stoppedThread,
-                              std::string &text);
-    HRESULT ReadStoreOnThread(StoreRef &ref, ICorDebugFrame *pFrame, DWORD threadId, CORDB_ADDRESS exceptionAddress,
-                              bool stoppedThread, std::string &text, HRESULT *pReadStatus = nullptr);
+    void ReadExceptionChain(ExceptionChain &chain);
+    HRESULT FindMatchOnThread(StoreRef &ref, ICorDebugFrame *pFrame, ExceptionChain &chain, bool stoppedThread,
+                              RingRead &result);
+    HRESULT ReadStoreOnThread(StoreRef &ref, ICorDebugFrame *pFrame, DWORD threadId, ExceptionChain &chain,
+                              bool stoppedThread, RingRead &result, HRESULT *pReadStatus = nullptr);
     void GetOtherThreads(ICorDebugThread *pStoppedThread, std::vector<OtherThread> &threads);
     bool GetOtherThreadFrame(OtherThread &other);
-    HRESULT SearchOtherThreads(StoreRef &ref, std::vector<OtherThread> &threads, CORDB_ADDRESS exceptionAddress,
-                               std::string &suffix);
+    HRESULT SearchOtherThreads(StoreRef &ref, std::vector<OtherThread> &threads, ExceptionChain &chain,
+                               std::vector<std::pair<DWORD, RingRead>> &matches, std::vector<DWORD> &wrapped,
+                               bool &limitReached);
 };
 
 } // namespace netcoredbg

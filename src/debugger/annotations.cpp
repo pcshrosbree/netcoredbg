@@ -24,6 +24,8 @@ namespace
 {
     // Longest annotation text shown, in UTF-16 code units.
     const ULONG32 MaxAnnotationLength = 4096;
+    // Inner exceptions followed past the current one.
+    const size_t MaxInnerExceptionDepth = 16;
 
     DWORD GetThreadOSId(ICorDebugThread *pThread)
     {
@@ -282,6 +284,21 @@ namespace
         return pRef->GetValue(pAddress);
     }
 
+    // An entry's Value: S_OK, or S_FALSE for null.
+    HRESULT GetEntryValue(ICorDebugObjectValue *pEntry, ICorDebugClass *pEntryClass, mdFieldDef valueField,
+                          ICorDebugValue **ppValue)
+    {
+        HRESULT Status;
+        ToRelease<ICorDebugValue> pValue;
+        IfFailRetQuiet(pEntry->GetFieldValue(pEntryClass, valueField, &pValue));
+        CORDB_ADDRESS address = 0;
+        IfFailRetQuiet(GetObjectAddress(pValue, &address));
+        if (Status == S_FALSE)
+            return S_FALSE;
+        *ppValue = pValue.Detach();
+        return S_OK;
+    }
+
     HRESULT ReadUInt32(ICorDebugValue *pValue, uint32_t &result)
     {
         HRESULT Status;
@@ -362,6 +379,78 @@ namespace
         });
 
         return *ppFrame != nullptr ? S_OK : E_FAIL;
+    }
+
+    // S_OK if the object is of the class or derives from it, S_FALSE if not; fails if its type could not be read.
+    HRESULT IsInstanceOf(ICorDebugValue *pValue, mdTypeDef classToken, CORDB_ADDRESS moduleAddress)
+    {
+        HRESULT Status;
+        ToRelease<ICorDebugValue> pPlain;
+        BOOL isNull = FALSE;
+        IfFailRetQuiet(DereferenceAndUnboxValue(pValue, &pPlain, &isNull));
+        if (isNull)
+            return S_FALSE;
+        ToRelease<ICorDebugValue2> pValue2;
+        ToRelease<ICorDebugType> pType;
+        IfFailRetQuiet(pPlain->QueryInterface(IID_ICorDebugValue2, (LPVOID*) &pValue2));
+        IfFailRetQuiet(pValue2->GetExactType(&pType));
+        while (pType != nullptr)
+        {
+            ToRelease<ICorDebugClass> pClass;
+            ToRelease<ICorDebugModule> pModule;
+            mdTypeDef token = mdTypeDefNil;
+            CORDB_ADDRESS address = 0;
+            IfFailRetQuiet(pType->GetClass(&pClass));
+            IfFailRetQuiet(pClass->GetToken(&token));
+            IfFailRetQuiet(pClass->GetModule(&pModule));
+            IfFailRetQuiet(pModule->GetBaseAddress(&address));
+            if (token == classToken && address == moduleAddress)
+                return S_OK;
+            ToRelease<ICorDebugType> pBase;
+            IfFailRetQuiet(pType->GetBase(&pBase));
+            pType = std::move(pBase);
+        }
+        return S_FALSE;
+    }
+
+    std::string AnnotationLine(size_t link, bool otherThread, DWORD threadId, const std::string &text)
+    {
+        std::string label;
+        if (link != 0)
+            label = "inner exception " + std::to_string(link);
+        if (otherThread)
+            label += (label.empty() ? "" : ", ") + std::string("recorded on thread ") + std::to_string(threadId);
+        return "\n Annotation" + (label.empty() ? std::string() : " (" + label + ")") + ": " + text;
+    }
+
+    // The line shown when no entry matched, if an entry can't be ruled out: one may have been displaced from a ring
+    // that has wrapped (contract 1 can't tell that from no entry at all), or the search was cut short.
+    std::string NoMatchLine(const std::vector<DWORD> &wrapped, bool limitReached, unsigned threadLimit,
+                            const std::string &chainIncomplete)
+    {
+        std::string line;
+        if (!wrapped.empty())
+        {
+            line = wrapped.size() == 1 ? "possibly not retained (ring wrapped on thread "
+                                       : "possibly not retained (rings wrapped on threads ";
+            for (size_t i = 0; i < wrapped.size(); i++)
+                line += (i == 0 ? "" : ", ") + std::to_string(wrapped[i]);
+            line += ")";
+        }
+        std::string why;
+        if (limitReached)
+            why = "thread limit of " + std::to_string(threadLimit) + " reached";
+        if (!chainIncomplete.empty())
+            why += (why.empty() ? "" : "; ") + chainIncomplete;
+        if (!why.empty())
+            line += (line.empty() ? "" : "; ") + std::string("search incomplete (") + why + ")";
+        return line.empty() ? line : "\n Annotation: " + line;
+    }
+
+    void AddThread(std::vector<DWORD> &threads, DWORD threadId)
+    {
+        if (std::find(threads.begin(), threads.end(), threadId) == threads.end())
+            threads.push_back(threadId);
     }
 
     const char *ReadOutcome(HRESULT status)
@@ -512,11 +601,89 @@ HRESULT Annotations::GetStores(std::vector<StoreRef> &stores)
     return S_OK;
 }
 
-// Reads one store's ring on the thread that pFrame belongs to. S_OK and the text of the newest entry whose exception is
-// the object at exceptionAddress; S_FALSE if there is none. Fails on any ICorDebug error, including
-// CORDBG_E_STATIC_VAR_NOT_AVAILABLE (no storage for the field on this thread).
-HRESULT Annotations::FindMatchOnThread(StoreRef &ref, ICorDebugFrame *pFrame, CORDB_ADDRESS exceptionAddress,
-                                       bool stoppedThread, std::string &text)
+// Caller must hold m_mutex. Reads the field System.Exception._innerException: the InnerException property would be a
+// func-eval.
+void Annotations::ReadExceptionChain(ExceptionChain &chain)
+{
+    if (chain.read)
+        return;
+    chain.read = true;
+    chain.incomplete = "inner exceptions could not be read";
+
+    ToRelease<ICorDebugModule> pCoreLib;
+    if (FAILED(m_sharedModules->ForEachModule([&](ICorDebugModule *pModule)
+        {
+            CORDB_ADDRESS baseAddress = 0;
+            if (pCoreLib == nullptr && SUCCEEDED(pModule->GetBaseAddress(&baseAddress)))
+            {
+                auto found = m_modules.find(baseAddress);
+                if (found != m_modules.end() && found->second.isCoreLib)
+                {
+                    pModule->AddRef();
+                    pCoreLib = pModule;
+                }
+            }
+            return S_OK;
+        })) || pCoreLib == nullptr)
+        return;
+
+    ToRelease<IMetaDataImport> pMD;
+    mdTypeDef exceptionToken = mdTypeDefNil;
+    mdFieldDef innerField = mdFieldDefNil;
+    PCCOR_SIGNATURE sig = nullptr;
+    ULONG sigSize = 0;
+    CORDB_ADDRESS coreLibAddress = 0;
+    ToRelease<ICorDebugClass> pExceptionClass;
+    if (FAILED(GetMetaDataImport(pCoreLib, &pMD)) ||
+        FAILED(pMD->FindTypeDefByName(W("System.Exception"), mdTokenNil, &exceptionToken)) ||
+        FAILED(FindField(pMD, exceptionToken, W("_innerException"), false, innerField, sig, sigSize)) ||
+        FAILED(pCoreLib->GetBaseAddress(&coreLibAddress)) ||
+        FAILED(pCoreLib->GetClassFromToken(exceptionToken, &pExceptionClass)))
+        return;
+    // The field is read at its offset in System.Exception, which the DBI does not check against the object's type.
+    const HRESULT instance = IsInstanceOf(chain.pException, exceptionToken, coreLibAddress);
+    if (FAILED(instance))
+        return;
+    chain.incomplete.clear();
+    if (instance != S_OK)
+        return;
+
+    ToRelease<ICorDebugValue> pHeld;
+    ICorDebugValue *pCurrent = chain.pException;
+    while (true)
+    {
+        ToRelease<ICorDebugValue> pPlain;
+        ToRelease<ICorDebugObjectValue> pObject;
+        ToRelease<ICorDebugValue> pInner;
+        CORDB_ADDRESS innerAddress = 0;
+        HRESULT status = E_FAIL;
+        if (SUCCEEDED(DereferenceAndUnboxValue(pCurrent, &pPlain, nullptr)) &&
+            SUCCEEDED(pPlain->QueryInterface(IID_ICorDebugObjectValue, (LPVOID*) &pObject)) &&
+            SUCCEEDED(pObject->GetFieldValue(pExceptionClass, innerField, &pInner)))
+            status = GetObjectAddress(pInner, &innerAddress);
+        if (FAILED(status))
+            chain.incomplete = "inner exception " + std::to_string(chain.links.size()) + " could not be read";
+        if (status != S_OK)
+            return;
+        // A chain made into a cycle (through reflection) is complete when it comes back to a link.
+        if (std::find(chain.links.begin(), chain.links.end(), innerAddress) != chain.links.end())
+            return;
+        if (chain.links.size() > MaxInnerExceptionDepth)
+        {
+            chain.incomplete = "inner exception chain longer than " + std::to_string(MaxInnerExceptionDepth);
+            return;
+        }
+        chain.links.push_back(innerAddress);
+        pHeld = std::move(pInner);
+        pCurrent = pHeld;
+    }
+}
+
+// Reads one store's ring on the thread that pFrame belongs to. S_OK and the text of the newest entry for the nearest
+// link of the exception chain that has one; S_FALSE if no entry is for any link. Fails on any ICorDebug error,
+// including CORDBG_E_STATIC_VAR_NOT_AVAILABLE (no storage for the field on this thread).
+HRESULT Annotations::FindMatchOnThread(StoreRef &ref, ICorDebugFrame *pFrame, ExceptionChain &chain,
+                                       bool stoppedThread, RingRead &result)
 {
     HRESULT Status;
     const Store &store = ref.store;
@@ -545,12 +712,14 @@ HRESULT Annotations::FindMatchOnThread(StoreRef &ref, ICorDebugFrame *pFrame, CO
     IfFailRetQuiet(pHolderClass->GetStaticFieldValue(store.countField, pFrame, &pCountValue));
     uint32_t count = 0; // wraps from 0xFFFFFFFF to 0; read as unsigned
     IfFailRetQuiet(ReadUInt32(pCountValue, count));
+    result.wrapped = count > length;
 
     ToRelease<ICorDebugClass> pEntryClass;
     IfFailRetQuiet(ref.pModule->GetClassFromToken(store.entryToken, &pEntryClass));
 
     // Visit every slot, newest first. The count only orders the slots; it never says which hold entries (at the wrap,
     // or on a thread stopped between the slot store and the count store, it can't).
+    std::vector<std::pair<CORDB_ADDRESS, ToRelease<ICorDebugObjectValue>>> others; // entries for other exceptions
     for (ULONG32 k = 0; k < length; k++)
     {
         const ULONG32 slot = (count - 1u - k) % length;
@@ -562,6 +731,9 @@ HRESULT Annotations::FindMatchOnThread(StoreRef &ref, ICorDebugFrame *pFrame, CO
         IfFailRetQuiet(DereferenceAndUnboxValue(pElementValue, &pElement, &isNull));
         if (isNull)
             continue;
+        // A first fill leaves every slot past `count` empty, so an entry there means the count has rolled over.
+        if (count < length && slot > count)
+            result.wrapped = true;
 
         // Defensive: with a validated Entry?[] ring and a sealed Entry nothing else can be in a slot.
         ToRelease<ICorDebugObjectValue> pEntry;
@@ -586,38 +758,62 @@ HRESULT Annotations::FindMatchOnThread(StoreRef &ref, ICorDebugFrame *pFrame, CO
 
         // Attribution is by object identity only. Never "the newest annotation since the last stop": catch A, then
         // stop at an unrelated B, and that would show A's annotation at B.
-        if (entryExceptionAddress != exceptionAddress)
+        if (entryExceptionAddress != chain.links[0])
+        {
+            others.emplace_back(entryExceptionAddress, std::move(pEntry));
+            continue;
+        }
+
+        ToRelease<ICorDebugValue> pEntryValue;
+        IfFailRetQuiet(GetEntryValue(pEntry, pEntryClass, store.valueField, &pEntryValue));
+        if (Status == S_FALSE)
+            continue; // defensive: no conforming producer stores a null value
+        result.link = 0;
+        return RenderValue(pEntryValue, result.text);
+    }
+
+    // No entry for the current exception: the newest entry for the nearest of its inner exceptions.
+    if (others.empty())
+        return S_FALSE;
+    ReadExceptionChain(chain);
+    ToRelease<ICorDebugValue> pMatchValue;
+    for (auto &other : others)
+    {
+        const size_t link = std::find(chain.links.begin() + 1, chain.links.end(), other.first) - chain.links.begin();
+        if (link == chain.links.size() || link >= result.link)
             continue;
 
         ToRelease<ICorDebugValue> pEntryValue;
-        IfFailRetQuiet(pEntry->GetFieldValue(pEntryClass, store.valueField, &pEntryValue));
-        CORDB_ADDRESS valueAddress = 0;
-        IfFailRetQuiet(GetObjectAddress(pEntryValue, &valueAddress));
+        IfFailRetQuiet(GetEntryValue(other.second, pEntryClass, store.valueField, &pEntryValue));
         if (Status == S_FALSE)
-            continue; // defensive: no conforming producer stores a null value
-
-        IfFailRetQuiet(RenderValue(pEntryValue, text));
-        return S_OK;
+            continue;
+        result.link = link;
+        pMatchValue = std::move(pEntryValue);
+        if (link == 1)
+            break;
     }
 
-    return S_FALSE;
+    if (result.link == SIZE_MAX)
+        return S_FALSE;
+    IfFailRetQuiet(RenderValue(pMatchValue, result.text));
+    return S_OK;
 }
 
 // FindMatchOnThread that never fails: an ICorDebug error while reading a store skips that store for this thread,
 // and CORDBG_E_STATIC_VAR_NOT_AVAILABLE means the thread has no storage for the ring, which for a holder without a
 // static constructor means it never recorded. Neither may fail or delay the exception report. Every call is one ring
 // read, and is logged as one (the log is how a test sees when the reader reads).
-HRESULT Annotations::ReadStoreOnThread(StoreRef &ref, ICorDebugFrame *pFrame, DWORD threadId,
-                                       CORDB_ADDRESS exceptionAddress, bool stoppedThread, std::string &text,
-                                       HRESULT *pReadStatus)
+HRESULT Annotations::ReadStoreOnThread(StoreRef &ref, ICorDebugFrame *pFrame, DWORD threadId, ExceptionChain &chain,
+                                       bool stoppedThread, RingRead &result, HRESULT *pReadStatus)
 {
-    HRESULT Status = FindMatchOnThread(ref, pFrame, exceptionAddress, stoppedThread, text);
+    HRESULT Status = FindMatchOnThread(ref, pFrame, chain, stoppedThread, result);
     if (pReadStatus != nullptr)
         *pReadStatus = Status;
 
     ++m_ringReads;
-    LOGI("Annotations: ring read %llu: store %s, %s thread %u: %s", (unsigned long long)m_ringReads,
-         ref.store.name.c_str(), stoppedThread ? "stopped" : "other", (unsigned)threadId, ReadOutcome(Status));
+    LOGI("Annotations: ring read %llu: store %s, %s thread %u: %s%s", (unsigned long long)m_ringReads,
+         ref.store.name.c_str(), stoppedThread ? "stopped" : "other", (unsigned)threadId, ReadOutcome(Status),
+         Status == S_OK && result.link != 0 ? (" (inner exception " + std::to_string(result.link) + ")").c_str() : "");
 
     if (SUCCEEDED(Status))
         return Status;
@@ -658,30 +854,39 @@ bool Annotations::GetOtherThreadFrame(OtherThread &other)
 
 // An exception rethrown on another thread (`await`, ExceptionDispatchInfo.Throw) is the same object, so its annotation
 // can be in the ring of the thread that recorded it. Best effort: that thread must still be alive, have a managed frame
-// and not have evicted the entry. Each match is labelled with the thread it was recorded on.
+// and not have evicted the entry.
 //
 // The thread limit (exceptionAnnotationThreadLimit, N; 0 means no limit) applies per store and per stop: for each store
 // the reader visits the other threads in EnumerateThreads order and reads the ring of at most N of them. A thread counts
 // toward N when it has a managed frame, so its ring is read, whatever the read finds (a match, no match, or no storage);
 // a thread without a managed frame cannot be read and does not count. Frames are looked up lazily, so with a limit the
 // lookups stop once N threads with a frame are found, and the same N are reused for every store at this stop.
-HRESULT Annotations::SearchOtherThreads(StoreRef &ref, std::vector<OtherThread> &threads, CORDB_ADDRESS exceptionAddress,
-                                        std::string &suffix)
+//
+// Returns every match with the thread it was recorded on, adds each thread whose ring has wrapped to `wrapped`, and
+// sets limitReached if the limit left a thread unread.
+HRESULT Annotations::SearchOtherThreads(StoreRef &ref, std::vector<OtherThread> &threads, ExceptionChain &chain,
+                                        std::vector<std::pair<DWORD, RingRead>> &matches, std::vector<DWORD> &wrapped,
+                                        bool &limitReached)
 {
     HRESULT Status;
     unsigned read = 0;
     for (auto &other : threads)
     {
         if (m_threadLimit != 0 && read >= m_threadLimit)
+        {
+            limitReached = true;
             break;
+        }
         if (!GetOtherThreadFrame(other))
             continue;
         read++;
 
-        std::string text;
-        IfFailRetQuiet(ReadStoreOnThread(ref, other.pFrame, other.threadId, exceptionAddress, false, text));
+        RingRead result;
+        IfFailRetQuiet(ReadStoreOnThread(ref, other.pFrame, other.threadId, chain, false, result));
+        if (result.wrapped)
+            AddThread(wrapped, other.threadId);
         if (Status == S_OK)
-            suffix += "\n Annotation (recorded on thread " + std::to_string(other.threadId) + "): " + text;
+            matches.emplace_back(other.threadId, std::move(result));
     }
 
     return S_OK;
@@ -711,25 +916,39 @@ HRESULT Annotations::AppendExceptionAnnotationsImpl(ICorDebugThread *pThread, st
         return S_OK;
 
     std::vector<StoreRef> stores;
-    if (FAILED(GetStores(stores)))
+    if (FAILED(GetStores(stores)) || stores.empty())
+    {
+        m_stopCache[threadId] = suffix;
         return S_OK;
+    }
+
+    ExceptionChain chain;
+    chain.pException = pException;
+    chain.links.assign(1, exceptionAddress);
 
     ToRelease<ICorDebugFrame> pFrame;
     const bool stoppedThreadHasFrame = SUCCEEDED(GetAnyManagedFrame(pThread, &pFrame));
     std::vector<OtherThread> otherThreads;
     bool otherThreadsListed = false;
+    bool matched = false;
+    std::vector<DWORD> wrapped;
+    bool limitReached = false;
 
     for (auto &ref : stores)
     {
-        // The stopped thread first. The preference is per store: a match in one store never suppresses another.
+        // Per store, the nearest link of the chain with an entry on any thread; at the same link, the stopped thread
+        // first. The preference is per store: a match in one store never suppresses another.
+        RingRead stopped;
         HRESULT readStatus = S_FALSE;
         if (stoppedThreadHasFrame)
         {
-            std::string text;
-            IfFailRetQuiet(ReadStoreOnThread(ref, pFrame, threadId, exceptionAddress, true, text, &readStatus));
-            if (Status == S_OK)
+            IfFailRetQuiet(ReadStoreOnThread(ref, pFrame, threadId, chain, true, stopped, &readStatus));
+            if (stopped.wrapped)
+                AddThread(wrapped, threadId);
+            if (Status == S_OK && stopped.link == 0)
             {
-                suffix += "\n Annotation: " + text;
+                suffix += AnnotationLine(0, false, threadId, stopped.text);
+                matched = true;
                 continue;
             }
         }
@@ -743,9 +962,32 @@ HRESULT Annotations::AppendExceptionAnnotationsImpl(ICorDebugThread *pThread, st
             GetOtherThreads(pThread, otherThreads);
             otherThreadsListed = true;
         }
-        IfFailRetQuiet(SearchOtherThreads(ref, otherThreads, exceptionAddress, suffix));
+        std::vector<std::pair<DWORD, RingRead>> matches;
+        IfFailRetQuiet(SearchOtherThreads(ref, otherThreads, chain, matches, wrapped, limitReached));
+
+        size_t nearest = readStatus == S_OK ? stopped.link : SIZE_MAX;
+        for (const auto &match : matches)
+            nearest = std::min(nearest, match.second.link);
+        if (nearest == SIZE_MAX)
+            continue;
+        matched = true;
+        if (readStatus == S_OK && stopped.link == nearest)
+        {
+            suffix += AnnotationLine(nearest, false, threadId, stopped.text);
+            continue;
+        }
+        for (const auto &match : matches)
+        {
+            if (match.second.link == nearest)
+                suffix += AnnotationLine(nearest, true, match.first, match.second.text);
+        }
     }
 
+    if (!matched)
+    {
+        ReadExceptionChain(chain);
+        suffix += NoMatchLine(wrapped, limitReached, m_threadLimit, chain.incomplete);
+    }
     m_stopCache[threadId] = suffix;
     return S_OK;
 }
