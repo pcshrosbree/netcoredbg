@@ -108,6 +108,11 @@ namespace NetcoreDbgTest.Script
             Assert.Equal(0, testProcess.ExitCode, @"__FILE__:__LINE__"+"\n"+caller_trace);
         }
 
+        public int StoppedThreadId()
+        {
+            return threadId;
+        }
+
         public Context(ControlInfo controlInfo, NetcoreDbgTestCore.DebuggerClient debuggerClient)
         {
             ControlInfo = controlInfo;
@@ -237,7 +242,9 @@ namespace VSCodeTestExceptionAnnotationsAttach
             Label.Checkpoint("detach", "finish", (Object context) => {
                 Context Context = (Context)context;
                 Context.WasExceptionStop(@"__FILE__:__LINE__");
-                Context.TestAnnotations(@"__FILE__:__LINE__", "System.ArgumentException", "cell R detach here");
+                // Nine writes: the ring has wrapped, so the reader can't rule out a displaced entry.
+                Context.TestAnnotations(@"__FILE__:__LINE__", "System.ArgumentException", "cell R detach here",
+                                        "Annotation: possibly not retained (ring wrapped on thread " + Context.StoppedThreadId() + ")");
                 Context.Detach(@"__FILE__:__LINE__");
             });
 

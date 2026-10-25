@@ -177,6 +177,22 @@ namespace NetcoreDbgTest.Script
             Assert.Equal(ExpectedDescription(excName, excMessage, annotations), description, @"__FILE__:__LINE__"+"\n"+caller_trace);
         }
 
+        // As TestAnnotations, for an exception with an inner exception: netcoredbg's own text names its type first.
+        public void TestInnerAnnotations(string caller_trace, string excName, string excMessage, string innerName, params string[] annotations)
+        {
+            var lines = new List<string> {
+                "Inner exceptions found, see $exception in variables window for more details.",
+                "Innermost exception: " + innerName
+            };
+            lines.AddRange(annotations);
+            TestAnnotations(caller_trace, excName, excMessage, lines.ToArray());
+        }
+
+        public int StoppedThreadId()
+        {
+            return threadId;
+        }
+
         public Context(ControlInfo controlInfo, NetcoreDbgTestCore.DebuggerClient debuggerClient)
         {
             ControlInfo = controlInfo;
@@ -329,7 +345,178 @@ namespace VSCodeTestExceptionAnnotations
             ThrowAnnotated(exception, "cell D site 2 annotation");
         }
 
-        // Cell E: the ring keeps 8 entries per thread; 7 later annotations keep the entry, 8 evict it.
+        // Runs a cell on a thread of its own, so the stopping thread's ring starts empty.
+        static void OnNewThread(Action cell)
+        {
+            var thread = new System.Threading.Thread(() => cell());
+            thread.Start();
+            thread.Join();
+        }
+
+        // Starts a thread that runs `record` and then waits, alive with a managed frame, until the returned action is
+        // called.
+        static Action StartWaitingThread(string name, Action record)
+        {
+            var ready = new ManualResetEvent(false);
+            var release = new ManualResetEvent(false);
+            var thread = new System.Threading.Thread(() => {
+                record();
+                ready.Set();
+                release.WaitOne();
+            });
+            thread.Name = name;
+            thread.Start();
+            ready.WaitOne();
+            return () => { release.Set(); thread.Join(); };
+        }
+
+        // links[0] wraps links[1], which wraps links[2], and so on; links[depth] has no inner exception.
+        static Exception[] Chain(string name, int depth)
+        {
+            var links = new Exception[depth + 1];
+            links[depth] = new ArgumentException(name + " inner " + depth);
+            for (int i = depth - 1; i >= 0; i--)
+                links[i] = new InvalidOperationException(i == 0 ? name : name + " inner " + i, links[i + 1]);
+            return links;
+        }
+
+        static void Fill(int count)
+        {
+            for (int i = 0; i < count; i++)
+                DebuggerAnnotationStore.Annotate("filler " + i, new InvalidOperationException("filler"));
+        }
+
+        // Cell I: the stopped exception has no entry, but an exception in its inner-exception chain does.
+        static void CellI()
+        {
+            // I1: the inner exception, annotated where it was thrown, then wrapped and thrown again.
+            OnNewThread(() => {
+                var inner = new ArgumentException("cell I1 inner");
+                try
+                {
+                    DebuggerAnnotationStore.Annotate("cell I1 inner annotation", inner);
+                    throw inner;
+                }
+                catch (Exception e)
+                {
+                    ThrowUnannotated(new InvalidOperationException("cell I1", e));
+                }
+            });
+
+            // I2: the inner exception's entry is on another thread.
+            Exception[] i2 = Chain("cell I2", 1);
+            Action endI2 = StartWaitingThread("cell I2 recording thread", () => DebuggerAnnotationStore.Annotate("cell I2 inner annotation", i2[1]));
+            OnNewThread(() => ThrowUnannotated(i2[0]));
+            endI2();
+
+            // I3: two links down; of two entries for that link, the newer.
+            OnNewThread(() => {
+                Exception[] links = Chain("cell I3", 2);
+                DebuggerAnnotationStore.Annotate("cell I3 inner 2 older annotation", links[2]);
+                DebuggerAnnotationStore.Annotate("cell I3 inner 2 annotation", links[2]);
+                ThrowUnannotated(links[0]);
+            });
+
+            // I4: the nearest link wins over a newer entry for a farther one.
+            OnNewThread(() => {
+                Exception[] links = Chain("cell I4", 1);
+                DebuggerAnnotationStore.Annotate("cell I4 outer annotation", links[0]);
+                DebuggerAnnotationStore.Annotate("cell I4 inner 1 annotation", links[1]);
+                ThrowUnannotated(links[0]);
+            });
+            OnNewThread(() => {
+                Exception[] links = Chain("cell I4b", 2);
+                DebuggerAnnotationStore.Annotate("cell I4b inner 1 annotation", links[1]);
+                DebuggerAnnotationStore.Annotate("cell I4b inner 2 annotation", links[2]);
+                ThrowUnannotated(links[0]);
+            });
+
+            // I5: the exception's own entry on another thread wins over its inner exception's on the stopped thread.
+            Exception[] i5 = Chain("cell I5", 1);
+            Action endI5 = StartWaitingThread("cell I5 recording thread", () => DebuggerAnnotationStore.Annotate("cell I5 outer annotation", i5[0]));
+            OnNewThread(() => {
+                DebuggerAnnotationStore.Annotate("cell I5 inner annotation", i5[1]);
+                ThrowUnannotated(i5[0]);
+            });
+            endI5();
+
+            // I6: at the same link, the stopped thread's entry wins over another thread's.
+            Exception[] i6 = Chain("cell I6", 1);
+            Action endI6 = StartWaitingThread("cell I6 recording thread", () => DebuggerAnnotationStore.Annotate("cell I6 other thread annotation", i6[1]));
+            OnNewThread(() => {
+                DebuggerAnnotationStore.Annotate("cell I6 stopped thread annotation", i6[1]);
+                ThrowUnannotated(i6[0]);
+            });
+            endI6();
+
+            // I7: two other threads, one with an entry for the exception, one for its inner exception: only the first.
+            Exception[] i7 = Chain("cell I7", 1);
+            Action endI7a = StartWaitingThread("cell I7 inner thread", () => DebuggerAnnotationStore.Annotate("cell I7 inner annotation", i7[1]));
+            Action endI7b = StartWaitingThread("cell I7 outer thread", () => DebuggerAnnotationStore.Annotate("cell I7 outer annotation", i7[0]));
+            OnNewThread(() => ThrowUnannotated(i7[0]));
+            endI7a();
+            endI7b();
+        }
+
+        // Cell ID: the walk follows 16 inner exceptions. At 16 the entry is found; at 17 the search is incomplete; a
+        // chain of exactly 16 with no entry shows nothing.
+        static void CellID()
+        {
+            OnNewThread(() => {
+                Exception[] links = Chain("cell ID16", 16);
+                DebuggerAnnotationStore.Annotate("cell ID16 inner 16 annotation", links[16]);
+                ThrowUnannotated(links[0]);
+            });
+            OnNewThread(() => {
+                Exception[] links = Chain("cell ID17", 17);
+                DebuggerAnnotationStore.Annotate("cell ID17 inner 17 annotation", links[17]);
+                ThrowUnannotated(links[0]);
+            });
+            OnNewThread(() => ThrowUnannotated(Chain("cell ID16n", 16)[0]));
+            // ID17n: a chain of 17 and no entry on any thread: still incomplete.
+            OnNewThread(() => ThrowUnannotated(Chain("cell ID17n", 17)[0]));
+        }
+
+        // Cell W: no entry for the exception, and a ring searched has had more writes than it holds, so the entry may
+        // have been displaced. W2 has exactly 8 writes (nothing displaced); in W4 the ring has wrapped but the entry
+        // is there.
+        static void CellW()
+        {
+            OnNewThread(() => {
+                var exception = new InvalidOperationException("cell W1");
+                DebuggerAnnotationStore.Annotate("cell W1 annotation", exception);
+                Fill(8);
+                ThrowUnannotated(exception);
+            });
+            OnNewThread(() => {
+                Fill(8);
+                ThrowUnannotated(new InvalidOperationException("cell W2"));
+            });
+            Action endW3 = StartWaitingThread("cell W3 wrapped thread", () => Fill(9));
+            OnNewThread(() => ThrowUnannotated(new InvalidOperationException("cell W3")));
+            endW3();
+            OnNewThread(() => {
+                var exception = new InvalidOperationException("cell W4");
+                Fill(8);
+                DebuggerAnnotationStore.Annotate("cell W4 annotation", exception);
+                ThrowUnannotated(exception);
+            });
+            // W5: the stopped thread's ring and another thread's have wrapped. W6: a wrapped ring and a chain longer
+            // than the walk follows.
+            Action endW5 = StartWaitingThread("cell W5 wrapped thread", () => Fill(9));
+            OnNewThread(() => {
+                Fill(9);
+                ThrowUnannotated(new InvalidOperationException("cell W5"));
+            });
+            endW5();
+            OnNewThread(() => {
+                Fill(9);
+                ThrowUnannotated(Chain("cell W6", 17)[0]);
+            });
+        }
+
+        // Cell E: the ring keeps 8 entries per thread; 7 later annotations keep the entry, 8 evict it, and the reader
+        // says the entry may not be retained.
         static void CellE(int later, string name)
         {
             var exception = new InvalidOperationException(name);
@@ -354,6 +541,24 @@ namespace VSCodeTestExceptionAnnotations
             });
             thread.Start();
             thread.Join();
+        }
+
+        // Cell M2: the count has rolled over to 2 (seeded to 0xFFFFFFFC, six entries in slots 4..7, 0, 1) and nothing
+        // matches: entries past slot 2 show the ring has wrapped. Cell M3: three entries and the count set back to 2, as
+        // on a thread stopped between the slot store and the count store: slot 2 is occupied, nothing has wrapped.
+        static void CellM2()
+        {
+            FieldInfo countField = typeof(DebuggerAnnotationStore).GetField("t_annotationCount", BindingFlags.NonPublic | BindingFlags.Static);
+            OnNewThread(() => {
+                countField.SetValue(null, unchecked((int)0xFFFFFFFC));
+                Fill(6);
+                ThrowUnannotated(new InvalidOperationException("cell M2"));
+            });
+            OnNewThread(() => {
+                Fill(3);
+                countField.SetValue(null, 2);
+                ThrowUnannotated(new InvalidOperationException("cell M3"));
+            });
         }
 
         // Cell N: the recording thread hands the exception over and blocks in a wait; another thread rethrows it with
@@ -390,7 +595,7 @@ namespace VSCodeTestExceptionAnnotations
             recorder.Join();
         }
 
-        // Cell O: another thread holds an annotation of its own exception; an unrelated exception here shows nothing.
+        // Cell O: another thread holds an annotation of its own exception; an unrelated exception here does not get it.
         static void CellO()
         {
             var ready = new ManualResetEvent(false);
@@ -562,13 +767,124 @@ namespace VSCodeTestExceptionAnnotations
 
             CellD();
 
-            Label.Checkpoint("cell_D", "cell_E", (Object context) => {
+            Label.Checkpoint("cell_D", "cell_I", (Object context) => {
                 Context Context = (Context)context;
                 Context.WasExceptionStop(@"__FILE__:__LINE__");
                 Context.TestAnnotations(@"__FILE__:__LINE__", "System.InvalidOperationException", "cell D", "Annotation: cell D site 1 annotation");
                 Context.Continue(@"__FILE__:__LINE__");
                 Context.WasExceptionStop(@"__FILE__:__LINE__");
                 Context.TestAnnotations(@"__FILE__:__LINE__", "System.InvalidOperationException", "cell D", "Annotation: cell D site 2 annotation");
+                Context.Continue(@"__FILE__:__LINE__");
+            });
+
+            CellI();
+
+            Label.Checkpoint("cell_I", "cell_ID", (Object context) => {
+                Context Context = (Context)context;
+                Context.WasExceptionStop(@"__FILE__:__LINE__");
+                Context.TestAnnotations(@"__FILE__:__LINE__", "System.ArgumentException", "cell I1 inner", "Annotation: cell I1 inner annotation");
+                Context.Continue(@"__FILE__:__LINE__");
+                Context.WasExceptionStop(@"__FILE__:__LINE__");
+                Context.TestInnerAnnotations(@"__FILE__:__LINE__", "System.InvalidOperationException", "cell I1", "System.ArgumentException",
+                                             "Annotation (inner exception 1): cell I1 inner annotation");
+                Context.Continue(@"__FILE__:__LINE__");
+                Context.WasExceptionStop(@"__FILE__:__LINE__");
+                int recorderI2 = Context.ThreadIdByName(@"__FILE__:__LINE__", "cell I2 recording thread");
+                Context.TestInnerAnnotations(@"__FILE__:__LINE__", "System.InvalidOperationException", "cell I2", "System.ArgumentException",
+                                             "Annotation (inner exception 1, recorded on thread " + recorderI2 + "): cell I2 inner annotation");
+                Context.Continue(@"__FILE__:__LINE__");
+                Context.WasExceptionStop(@"__FILE__:__LINE__");
+                Context.TestInnerAnnotations(@"__FILE__:__LINE__", "System.InvalidOperationException", "cell I3", "System.InvalidOperationException",
+                                             "Annotation (inner exception 2): cell I3 inner 2 annotation");
+                Context.Continue(@"__FILE__:__LINE__");
+                Context.WasExceptionStop(@"__FILE__:__LINE__");
+                Context.TestInnerAnnotations(@"__FILE__:__LINE__", "System.InvalidOperationException", "cell I4", "System.ArgumentException",
+                                             "Annotation: cell I4 outer annotation");
+                Context.Continue(@"__FILE__:__LINE__");
+                Context.WasExceptionStop(@"__FILE__:__LINE__");
+                Context.TestInnerAnnotations(@"__FILE__:__LINE__", "System.InvalidOperationException", "cell I4b", "System.InvalidOperationException",
+                                             "Annotation (inner exception 1): cell I4b inner 1 annotation");
+                Context.Continue(@"__FILE__:__LINE__");
+                Context.WasExceptionStop(@"__FILE__:__LINE__");
+                int recorderI5 = Context.ThreadIdByName(@"__FILE__:__LINE__", "cell I5 recording thread");
+                Context.TestInnerAnnotations(@"__FILE__:__LINE__", "System.InvalidOperationException", "cell I5", "System.ArgumentException",
+                                             "Annotation (recorded on thread " + recorderI5 + "): cell I5 outer annotation");
+                Context.Continue(@"__FILE__:__LINE__");
+                Context.WasExceptionStop(@"__FILE__:__LINE__");
+                Context.TestInnerAnnotations(@"__FILE__:__LINE__", "System.InvalidOperationException", "cell I6", "System.ArgumentException",
+                                             "Annotation (inner exception 1): cell I6 stopped thread annotation");
+                Context.Continue(@"__FILE__:__LINE__");
+                Context.WasExceptionStop(@"__FILE__:__LINE__");
+                int outerI7 = Context.ThreadIdByName(@"__FILE__:__LINE__", "cell I7 outer thread");
+                Context.TestInnerAnnotations(@"__FILE__:__LINE__", "System.InvalidOperationException", "cell I7", "System.ArgumentException",
+                                             "Annotation (recorded on thread " + outerI7 + "): cell I7 outer annotation");
+                Context.Continue(@"__FILE__:__LINE__");
+            });
+
+            CellID();
+
+            Label.Checkpoint("cell_ID", "cell_W", (Object context) => {
+                Context Context = (Context)context;
+                Context.WasExceptionStop(@"__FILE__:__LINE__");
+                Context.TestInnerAnnotations(@"__FILE__:__LINE__", "System.InvalidOperationException", "cell ID16", "System.InvalidOperationException",
+                                             "Annotation (inner exception 16): cell ID16 inner 16 annotation");
+                Context.Continue(@"__FILE__:__LINE__");
+                Context.WasExceptionStop(@"__FILE__:__LINE__");
+                Context.TestInnerAnnotations(@"__FILE__:__LINE__", "System.InvalidOperationException", "cell ID17", "System.InvalidOperationException",
+                                             "Annotation: search incomplete (inner exception chain longer than 16)");
+                Context.Continue(@"__FILE__:__LINE__");
+                Context.WasExceptionStop(@"__FILE__:__LINE__");
+                Context.TestInnerAnnotations(@"__FILE__:__LINE__", "System.InvalidOperationException", "cell ID16n", "System.InvalidOperationException");
+                Context.Continue(@"__FILE__:__LINE__");
+                Context.WasExceptionStop(@"__FILE__:__LINE__");
+                Context.TestInnerAnnotations(@"__FILE__:__LINE__", "System.InvalidOperationException", "cell ID17n", "System.InvalidOperationException",
+                                             "Annotation: search incomplete (inner exception chain longer than 16)");
+                Context.Continue(@"__FILE__:__LINE__");
+            });
+
+            CellW();
+
+            Label.Checkpoint("cell_W", "cell_M2", (Object context) => {
+                Context Context = (Context)context;
+                Context.WasExceptionStop(@"__FILE__:__LINE__");
+                Context.TestAnnotations(@"__FILE__:__LINE__", "System.InvalidOperationException", "cell W1",
+                                        "Annotation: possibly not retained (ring wrapped on thread " + Context.StoppedThreadId() + ")");
+                Context.Continue(@"__FILE__:__LINE__");
+                Context.WasExceptionStop(@"__FILE__:__LINE__");
+                Context.TestAnnotations(@"__FILE__:__LINE__", "System.InvalidOperationException", "cell W2");
+                Context.Continue(@"__FILE__:__LINE__");
+                Context.WasExceptionStop(@"__FILE__:__LINE__");
+                int wrappedW3 = Context.ThreadIdByName(@"__FILE__:__LINE__", "cell W3 wrapped thread");
+                Context.TestAnnotations(@"__FILE__:__LINE__", "System.InvalidOperationException", "cell W3",
+                                        "Annotation: possibly not retained (ring wrapped on thread " + wrappedW3 + ")");
+                Context.Continue(@"__FILE__:__LINE__");
+                Context.WasExceptionStop(@"__FILE__:__LINE__");
+                Context.TestAnnotations(@"__FILE__:__LINE__", "System.InvalidOperationException", "cell W4", "Annotation: cell W4 annotation");
+                Context.Continue(@"__FILE__:__LINE__");
+                Context.WasExceptionStop(@"__FILE__:__LINE__");
+                int wrappedW5 = Context.ThreadIdByName(@"__FILE__:__LINE__", "cell W5 wrapped thread");
+                Context.TestAnnotations(@"__FILE__:__LINE__", "System.InvalidOperationException", "cell W5",
+                                        "Annotation: possibly not retained (rings wrapped on threads " + Context.StoppedThreadId() + ", " + wrappedW5 + ")");
+                Context.Continue(@"__FILE__:__LINE__");
+                Context.WasExceptionStop(@"__FILE__:__LINE__");
+                Context.TestInnerAnnotations(@"__FILE__:__LINE__", "System.InvalidOperationException", "cell W6", "System.InvalidOperationException",
+                                             "Annotation: possibly not retained (ring wrapped on thread " + Context.StoppedThreadId() + "); " +
+                                             "search incomplete (inner exception chain longer than 16)");
+                Context.Continue(@"__FILE__:__LINE__");
+            });
+
+            // Here rather than beside cell M: after cell E this thread's own ring has wrapped, which every no-match
+            // line would name.
+            CellM2();
+
+            Label.Checkpoint("cell_M2", "cell_E", (Object context) => {
+                Context Context = (Context)context;
+                Context.WasExceptionStop(@"__FILE__:__LINE__");
+                Context.TestAnnotations(@"__FILE__:__LINE__", "System.InvalidOperationException", "cell M2",
+                                        "Annotation: possibly not retained (ring wrapped on thread " + Context.StoppedThreadId() + ")");
+                Context.Continue(@"__FILE__:__LINE__");
+                Context.WasExceptionStop(@"__FILE__:__LINE__");
+                Context.TestAnnotations(@"__FILE__:__LINE__", "System.InvalidOperationException", "cell M3");
                 Context.Continue(@"__FILE__:__LINE__");
             });
 
@@ -581,7 +897,8 @@ namespace VSCodeTestExceptionAnnotations
                 Context.TestAnnotations(@"__FILE__:__LINE__", "System.InvalidOperationException", "cell E7", "Annotation: cell E7 annotation");
                 Context.Continue(@"__FILE__:__LINE__");
                 Context.WasExceptionStop(@"__FILE__:__LINE__");
-                Context.TestAnnotations(@"__FILE__:__LINE__", "System.InvalidOperationException", "cell E8");
+                Context.TestAnnotations(@"__FILE__:__LINE__", "System.InvalidOperationException", "cell E8",
+                                        "Annotation: possibly not retained (ring wrapped on thread " + Context.StoppedThreadId() + ")");
                 Context.Continue(@"__FILE__:__LINE__");
             });
 
@@ -616,7 +933,9 @@ namespace VSCodeTestExceptionAnnotations
                 Context.TestAnnotations(@"__FILE__:__LINE__", "System.InvalidOperationException", "cell O thread", "Annotation: cell O annotation");
                 Context.Continue(@"__FILE__:__LINE__");
                 Context.WasExceptionStop(@"__FILE__:__LINE__");
-                Context.TestAnnotations(@"__FILE__:__LINE__", "System.ArgumentException", "cell O");
+                // This thread's ring has wrapped since cell E.
+                Context.TestAnnotations(@"__FILE__:__LINE__", "System.ArgumentException", "cell O",
+                                        "Annotation: possibly not retained (ring wrapped on thread " + Context.StoppedThreadId() + ")");
                 Context.Continue(@"__FILE__:__LINE__");
             });
 

@@ -243,6 +243,11 @@ namespace NetcoreDbgTest.Script
             Assert.True(recorders > limit, @"__FILE__:__LINE__"+"\n"+caller_trace);
         }
 
+        public int StoppedThreadId()
+        {
+            return threadId;
+        }
+
         public Context(ControlInfo controlInfo, NetcoreDbgTestCore.DebuggerClient debuggerClient)
         {
             ControlInfo = controlInfo;
@@ -610,6 +615,58 @@ namespace VSCodeTestExceptionAnnotationsStores
                 thread.Join();
         }
 
+        // Cell CUT: no entry for the exception, and 32 other threads with a managed frame; with a thread limit of 31 one
+        // is left unread, so the reader can't say that there is no entry.
+        // Cell CUT2: as CUT, but the exception is thrown on a new thread whose ring has wrapped: both clauses.
+        static void CellCut(bool wrappedStoppingThread)
+        {
+            var ready = new CountdownEvent(LimitRecorders);
+            var release = new ManualResetEvent(false);
+            var threads = new List<System.Threading.Thread>();
+            for (int i = 1; i <= LimitRecorders; i++)
+            {
+                var thread = new System.Threading.Thread(() => {
+                    ready.Signal();
+                    release.WaitOne();
+                });
+                threads.Add(thread);
+                thread.Start();
+            }
+            ready.Wait();
+
+            if (wrappedStoppingThread)
+            {
+                var thrower = new System.Threading.Thread(() => {
+                    for (int i = 0; i < 9; i++)
+                        DebuggerAnnotationStore.Annotate("cell CUT2 filler " + i, new InvalidOperationException("filler"));
+                    ThrowUnannotated(new InvalidOperationException("cell CUT2"));
+                });
+                thrower.Start();
+                thrower.Join();
+            }
+            else
+                ThrowUnannotated(new InvalidOperationException("cell CUT"));
+            release.Set();
+            foreach (var thread in threads)
+                thread.Join();
+        }
+
+        // Cell WS: on a new thread both stores' rings have wrapped and neither has an entry for the exception; the
+        // thread is named once.
+        static void CellWrappedStores()
+        {
+            var thread = new System.Threading.Thread(() => {
+                for (int i = 0; i < 9; i++)
+                {
+                    DebuggerAnnotationStore.Annotate("cell WS filler " + i, new InvalidOperationException("filler"));
+                    ExtraNamedStore.Record("cell WS filler " + i, new InvalidOperationException("filler"));
+                }
+                ThrowUnannotated(new InvalidOperationException("cell WS"));
+            });
+            thread.Start();
+            thread.Join();
+        }
+
         static void Main(string[] args)
         {
             Label.Checkpoint("init", "cell_X", (Object context) => {
@@ -701,10 +758,36 @@ namespace VSCodeTestExceptionAnnotationsStores
 
             CellLimit();
 
-            Label.Checkpoint("cell_LIM", "finish", (Object context) => {
+            Label.Checkpoint("cell_LIM", "cell_CUT", (Object context) => {
                 Context Context = (Context)context;
                 Context.WasExceptionStop(@"__FILE__:__LINE__");
                 Context.TestThreadLimit(@"__FILE__:__LINE__", "System.InvalidOperationException", "cell LIM", 31, 32);
+                Context.Continue(@"__FILE__:__LINE__");
+            });
+
+            CellCut(false);
+            CellCut(true);
+
+            Label.Checkpoint("cell_CUT", "cell_WS", (Object context) => {
+                Context Context = (Context)context;
+                Context.WasExceptionStop(@"__FILE__:__LINE__");
+                Context.TestAnnotations(@"__FILE__:__LINE__", "System.InvalidOperationException", "cell CUT",
+                                        "Annotation: search incomplete (thread limit of 31 reached)");
+                Context.Continue(@"__FILE__:__LINE__");
+                Context.WasExceptionStop(@"__FILE__:__LINE__");
+                Context.TestAnnotations(@"__FILE__:__LINE__", "System.InvalidOperationException", "cell CUT2",
+                                        "Annotation: possibly not retained (ring wrapped on thread " + Context.StoppedThreadId() + "); " +
+                                        "search incomplete (thread limit of 31 reached)");
+                Context.Continue(@"__FILE__:__LINE__");
+            });
+
+            CellWrappedStores();
+
+            Label.Checkpoint("cell_WS", "finish", (Object context) => {
+                Context Context = (Context)context;
+                Context.WasExceptionStop(@"__FILE__:__LINE__");
+                Context.TestAnnotations(@"__FILE__:__LINE__", "System.InvalidOperationException", "cell WS",
+                                        "Annotation: possibly not retained (ring wrapped on thread " + Context.StoppedThreadId() + ")");
                 Context.Continue(@"__FILE__:__LINE__");
             });
 
